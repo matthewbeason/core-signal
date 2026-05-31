@@ -88,7 +88,79 @@ class CoreSignalTests(unittest.TestCase):
             self.assertTrue(dated.exists())
             self.assertTrue(latest.exists())
             self.assertIn("Core Signal Morning Brief", latest.read_text())
-            self.assertIn("No recent issue detected", latest.read_text())
+            self.assertNotIn("Issue Location:", latest.read_text())
+
+    def test_healthy_report_starts_with_clear_status_and_action(self) -> None:
+        result = analyze([obs(0, "1.1.1.1", 20), obs(0, "192.168.1.1", 10)], None)
+        markdown = render_brief(result)
+        lines = markdown.splitlines()
+        self.assertEqual(lines[0], "# Core Signal Morning Brief - 2026-05-30")
+        self.assertEqual(lines[2], "Status: Healthy")
+        self.assertIn("Recommended Action: None.", markdown)
+        self.assertNotIn("Issue Location:", markdown.split("Technical Evidence:", 1)[0])
+
+    def test_isolated_low_count_blips_remain_healthy(self) -> None:
+        rows = [
+            obs(0, "192.168.1.1", 20),
+            obs(0, "1.1.1.1", 160),
+            obs(1, "192.168.1.1", 20),
+            obs(1, "1.1.1.1", 20),
+            obs(2, "192.168.1.1", 20),
+            obs(2, "1.1.1.1", 170),
+            obs(3, "192.168.1.1", 20),
+            obs(3, "1.1.1.1", 20),
+            obs(4, "192.168.1.1", 20),
+            obs(4, "1.1.1.1", 180),
+        ]
+        markdown = render_brief(analyze(rows, None))
+        self.assertIn("Status: Healthy", markdown)
+        self.assertIn("A few brief blips were not operationally significant.", markdown)
+        self.assertNotIn("Issue Location:", markdown.split("Technical Evidence:", 1)[0])
+
+    def test_repeated_non_sustained_instability_is_watch(self) -> None:
+        rows = []
+        for minute in range(8):
+            rows.append(obs(minute, "192.168.1.1", 20))
+            rows.append(obs(minute, "1.1.1.1", 170 if minute in {0, 2, 4, 6} else 20))
+        markdown = render_brief(analyze(rows, None))
+        self.assertIn("Status: Watch", markdown)
+        self.assertIn("Issue Location: Likely upstream/ISP issue", markdown)
+        self.assertIn("Recommended Action: No action unless", markdown)
+
+    def test_no_action_report_does_not_lead_with_metrics(self) -> None:
+        result = analyze([obs(0, "1.1.1.1", 20), obs(0, "192.168.1.1", 10)], None)
+        markdown = render_brief(result)
+        before_technical = markdown.split("Technical Evidence:", 1)[0]
+        for term in ("p95", "jitter", "packet loss", "WAN", "LAN", "baseline delta"):
+            self.assertNotIn(term, before_technical)
+
+    def test_plain_language_issue_locations_are_rendered(self) -> None:
+        upstream = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+        )
+        self.assertIn("Issue Location: Likely upstream/ISP issue", render_brief(upstream))
+
+        local = analyze(
+            [
+                obs(0, "192.168.1.1", 150),
+                obs(1, "192.168.1.1", 160),
+                obs(2, "192.168.1.1", 170),
+                obs(0, "1.1.1.1", 20),
+                obs(1, "1.1.1.1", 20),
+                obs(2, "1.1.1.1", 20),
+            ],
+            None,
+        )
+        self.assertIn("Issue Location: Likely local Wi-Fi/router issue", render_brief(local))
+
+        unclear = analyze([], None)
+        self.assertIn("Issue Location: Unclear source", render_brief(unclear))
 
 
 if __name__ == "__main__":
