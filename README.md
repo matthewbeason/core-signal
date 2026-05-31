@@ -62,6 +62,55 @@ Run tests:
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
+## macOS LaunchAgent
+
+Core Signal can install a user LaunchAgent that runs the morning briefing daily
+at 6:00 AM. The LaunchAgent calls the local Core Signal CLI and writes the
+normal dated report plus `reports/latest.md`.
+
+Preview the generated plist:
+
+```bash
+./scripts/setup_launchagent.sh print-plist
+```
+
+Install and load the LaunchAgent:
+
+```bash
+./scripts/setup_launchagent.sh install
+```
+
+Check status:
+
+```bash
+./scripts/setup_launchagent.sh status
+```
+
+Remove the LaunchAgent:
+
+```bash
+./scripts/setup_launchagent.sh uninstall
+```
+
+The plist is installed at:
+
+```text
+~/Library/LaunchAgents/com.mbeason.core-signal.morning-brief.plist
+```
+
+Logs are written to:
+
+```text
+logs/launchagent.out.log
+logs/launchagent.err.log
+```
+
+If Python lives somewhere other than `/opt/homebrew/bin/python3`, install with:
+
+```bash
+PYTHON_BIN=/path/to/python3 ./scripts/setup_launchagent.sh install
+```
+
 ## Prime Observer Assumptions
 
 Core Signal v0.1 assumes Prime Observer exports rows shaped like
