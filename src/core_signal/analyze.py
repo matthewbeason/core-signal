@@ -6,19 +6,7 @@ from statistics import median
 from typing import Any
 
 from .ingest import Observation, parse_timestamp
-
-
-GATEWAY_HOST = "192.168.1.1"
-WAN_HOSTS = {"1.1.1.1", "9.9.9.9"}
-
-WAN_BAD_P95_MS = 140.0
-WAN_BAD_JITTER_MS = 50.0
-WAN_BAD_LOSS_PCT = 1.0
-WAN_BAD_PERSISTENCE = 2
-TURBULENCE_BUCKET_MINUTES = 15
-TURBULENCE_MIN_RAW_BAD = 4
-LAN_ELEVATED_P95_MS = 120.0
-ATTRIBUTION_MINUTES = 15
+from . import policy
 
 
 @dataclass(frozen=True)
@@ -53,9 +41,9 @@ def quantile(values: list[float], q: float) -> float | None:
 
 def is_raw_wan_bad(point: SeriesPoint) -> bool:
     return (
-        point.p95_ms > WAN_BAD_P95_MS
-        or point.jitter_ms > WAN_BAD_JITTER_MS
-        or point.loss_pct > WAN_BAD_LOSS_PCT
+        point.p95_ms > policy.WAN_BAD_P95_MS
+        or point.jitter_ms > policy.WAN_BAD_JITTER_MS
+        or point.loss_pct > policy.WAN_BAD_LOSS_PCT
     )
 
 
@@ -78,11 +66,11 @@ def collapse_series(observations: list[Observation]) -> tuple[list[SeriesPoint],
             baseline_sample_count=obs.baseline_sample_count,
         )
         key = (obs.phase, obs.ts)
-        if obs.host == GATEWAY_HOST:
+        if obs.host == policy.GATEWAY_HOST:
             prev = lan_by_key.get(key)
             if prev is None or point.p95_ms > prev.p95_ms:
                 lan_by_key[key] = point
-        elif obs.host in WAN_HOSTS:
+        elif obs.host in policy.WAN_HOSTS:
             prev = wan_by_key.get(key)
             if prev is None or point.p95_ms > prev.p95_ms:
                 wan_by_key[key] = point
@@ -103,14 +91,14 @@ def mark_sustained_bad(wan: list[SeriesPoint]) -> list[SeriesPoint]:
                 **{
                     **point.__dict__,
                     "raw_bad": raw_bad,
-                    "sustained_bad": streak >= WAN_BAD_PERSISTENCE,
+                    "sustained_bad": streak >= policy.WAN_BAD_PERSISTENCE,
                 }
             )
         )
     return marked
 
 
-def bucket_start(ts: dt.datetime, minutes: int = TURBULENCE_BUCKET_MINUTES) -> dt.datetime:
+def bucket_start(ts: dt.datetime, minutes: int = policy.TURBULENCE_BUCKET_MINUTES) -> dt.datetime:
     epoch = ts.timestamp()
     bucket_seconds = minutes * 60
     return dt.datetime.fromtimestamp(
@@ -137,15 +125,15 @@ def classify_buckets(wan: list[SeriesPoint]) -> list[dict[str, Any]]:
         results.append(
             {
                 "start": start,
-                "end": start + dt.timedelta(minutes=TURBULENCE_BUCKET_MINUTES),
+                "end": start + dt.timedelta(minutes=policy.TURBULENCE_BUCKET_MINUTES),
                 "total": len(rows),
                 "raw_bad": raw_bad,
                 "sustained_bad": sustained,
                 "max_raw_run": max_raw_run,
                 "is_sustained": sustained > 0,
                 "is_turbulence": sustained == 0
-                and raw_bad >= TURBULENCE_MIN_RAW_BAD
-                and max_raw_run < WAN_BAD_PERSISTENCE,
+                and raw_bad >= policy.TURBULENCE_MIN_RAW_BAD
+                and max_raw_run < policy.WAN_BAD_PERSISTENCE,
             }
         )
     return results
@@ -216,14 +204,14 @@ def attribution(wan: list[SeriesPoint], lan: list[SeriesPoint], end: dt.datetime
     if end is None:
         return {"label": "No recent data", "confidence": "Low", "why": "No telemetry was available."}
 
-    cut = end - dt.timedelta(minutes=ATTRIBUTION_MINUTES)
+    cut = end - dt.timedelta(minutes=policy.ATTRIBUTION_MINUTES)
     recent_wan = [p for p in wan if p.ts >= cut]
     recent_lan = [p for p in lan if p.ts >= cut]
     recent_buckets = [b for b in classify_buckets(wan) if b["end"] >= cut]
 
     wan_bad = any(p.sustained_bad for p in recent_wan)
     wan_turbulence = any(b["is_turbulence"] for b in recent_buckets)
-    lan_elevated = [p for p in recent_lan if p.p95_ms > LAN_ELEVATED_P95_MS]
+    lan_elevated = [p for p in recent_lan if p.p95_ms > policy.LAN_ELEVATED_P95_MS]
     lan_rate = len(lan_elevated) / len(recent_lan) if recent_lan else 0.0
     lan_bad = len(lan_elevated) >= 3 and lan_rate > 0.2
 
@@ -252,8 +240,8 @@ def attribution(wan: list[SeriesPoint], lan: list[SeriesPoint], end: dt.datetime
             "why": f"WAN showed {'sustained degradation' if wan_bad else 'turbulence'} while LAN stayed below the local threshold.",
         }
     return {
-        "label": "No network issue detected",
-        "confidence": "High",
+        "label": "No recent issue detected",
+        "confidence": "Recent window",
         "why": "LAN and WAN both looked stable in the last 15 minutes of the export.",
     }
 
@@ -289,6 +277,8 @@ def analyze(
     dns: dict[str, Any] | None = None,
     start: dt.datetime | None = None,
     end: dt.datetime | None = None,
+    warnings: list[str] | None = None,
+    ignored_hosts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     if observations and (start is None or end is None):
         end = max(o.ts for o in observations)
@@ -321,5 +311,6 @@ def analyze(
         "turbulence_buckets": turbulence_buckets,
         "raw_spikes": raw_spikes,
         "dns": dns_context(dns, end),
+        "warnings": list(warnings or []),
+        "ignored_hosts": dict(ignored_hosts or {}),
     }
-

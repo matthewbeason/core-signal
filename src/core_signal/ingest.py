@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import policy
+
 
 DEFAULT_CSV = Path("/Users/mbeason/prime-observer/viz/latest.csv")
 DEFAULT_DNS = Path("/Users/mbeason/prime-observer/viz/nextdns_summary.json")
@@ -23,6 +25,17 @@ class Observation:
     baseline_p95: float | None = None
     baseline_delta_pct: float | None = None
     baseline_sample_count: int | None = None
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    observations: list[Observation]
+    warnings: list[str]
+    ignored_hosts: dict[str, int]
+
+
+class CsvSchemaError(ValueError):
+    """Raised when a Prime Observer CSV export is unreadable for Core Signal."""
 
 
 def parse_timestamp(value: str) -> dt.datetime | None:
@@ -57,18 +70,37 @@ def parse_int(value: Any, default: int | None = None) -> int | None:
     return int(number)
 
 
-def read_observations(csv_path: Path) -> list[Observation]:
+def read_observations(csv_path: Path) -> IngestResult:
     if not csv_path.exists():
         raise FileNotFoundError(f"Prime Observer CSV export not found: {csv_path}")
 
     observations: list[Observation] = []
+    warnings: list[str] = []
+    ignored_hosts: dict[str, int] = {}
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
+        headers = set(reader.fieldnames or [])
+        missing = sorted(policy.REQUIRED_CSV_HEADERS - headers)
+        if missing:
+            raise CsvSchemaError(
+                f"Prime Observer CSV export is missing required header(s): {', '.join(missing)}"
+            )
+
+        missing_optional = sorted(policy.OPTIONAL_CSV_HEADERS - headers)
+        if missing_optional:
+            warnings.append(
+                "CSV export is missing optional header(s): "
+                + ", ".join(missing_optional)
+            )
+
         for row in reader:
             ts = parse_timestamp(row.get("ts", ""))
             host = (row.get("host") or "").strip()
             p95 = parse_float(row.get("p95_ms"), None)
             if ts is None or not host or p95 is None:
+                continue
+            if host != policy.GATEWAY_HOST and host not in policy.WAN_HOSTS:
+                ignored_hosts[host] = ignored_hosts.get(host, 0) + 1
                 continue
             observations.append(
                 Observation(
@@ -83,7 +115,7 @@ def read_observations(csv_path: Path) -> list[Observation]:
                     baseline_sample_count=parse_int(row.get("baseline_sample_count"), None),
                 )
             )
-    return observations
+    return IngestResult(observations, warnings, ignored_hosts)
 
 
 def latest_window(
@@ -111,8 +143,7 @@ def load_inputs(
     csv_path: Path = DEFAULT_CSV,
     dns_path: Path | None = DEFAULT_DNS,
     window_hours: int = 24,
-) -> tuple[list[Observation], dict[str, Any] | None, dt.datetime | None, dt.datetime | None]:
-    observations = read_observations(csv_path)
-    window, start, end = latest_window(observations, window_hours)
-    return window, read_dns_summary(dns_path), start, end
-
+) -> tuple[IngestResult, dict[str, Any] | None, dt.datetime | None, dt.datetime | None]:
+    result = read_observations(csv_path)
+    window, start, end = latest_window(result.observations, window_hours)
+    return IngestResult(window, result.warnings, result.ignored_hosts), read_dns_summary(dns_path), start, end

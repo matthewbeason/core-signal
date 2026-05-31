@@ -4,6 +4,8 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
+from . import policy
+
 
 def fmt_ts(value: dt.datetime | None) -> str:
     if value is None:
@@ -41,6 +43,13 @@ def headline(analysis: dict[str, Any]) -> str:
     return "WAN looked stable across the latest observation window."
 
 
+def format_attribution_scope(attribution: dict[str, str]) -> str:
+    confidence = attribution.get("confidence", "")
+    if confidence == "Recent window":
+        return "recent window only"
+    return f"{confidence} confidence"
+
+
 def render_brief(analysis: dict[str, Any]) -> str:
     date = report_date(analysis)
     wan = analysis["wan_health"]
@@ -67,7 +76,7 @@ def render_brief(analysis: dict[str, Any]) -> str:
         "",
         "## What Happened?",
         "",
-        f"The latest 24-hour export was interpreted using Prime Observer's WAN thresholds: p95 latency above 140 ms, jitter above 50 ms, or packet loss above 1%. A sustained bad moment requires two consecutive raw bad WAN samples.",
+        f"The latest 24-hour export was interpreted using Core Signal's Prime Observer v0.4.1-aligned policy: p95 latency above {policy.WAN_BAD_P95_MS:.0f} ms, jitter above {policy.WAN_BAD_JITTER_MS:.0f} ms, or packet loss above {policy.WAN_BAD_LOSS_PCT:.0f}%. A sustained bad moment requires {policy.WAN_BAD_PERSISTENCE} consecutive raw bad WAN samples.",
         "",
     ]
 
@@ -111,7 +120,7 @@ def render_brief(analysis: dict[str, Any]) -> str:
             "",
             "## What Deserves Attention?",
             "",
-            f"Recent attribution: {attribution['label']} ({attribution['confidence']} confidence). {attribution['why']}",
+            f"Recent attribution: {attribution['label']} ({format_attribution_scope(attribution)}). {attribution['why']}",
         ]
     )
 
@@ -121,6 +130,16 @@ def render_brief(analysis: dict[str, Any]) -> str:
         lines.append("Watch turbulence if it repeats on future mornings; by itself it is informational rather than urgent.")
     else:
         lines.append("No immediate network action is suggested by this export.")
+
+    ignored_hosts = analysis.get("ignored_hosts") or {}
+    warnings = analysis.get("warnings") or []
+    if ignored_hosts or warnings:
+        lines.extend(["", "## Data Notes", ""])
+        for warning in warnings:
+            lines.append(f"- {warning}.")
+        if ignored_hosts:
+            host_text = ", ".join(f"{host} ({count} rows)" for host, count in sorted(ignored_hosts.items()))
+            lines.append(f"- Ignored unclassified host telemetry: {host_text}.")
 
     lines.extend(["", "## DNS / Security Context", ""])
     if dns.get("available"):
@@ -135,13 +154,13 @@ def render_brief(analysis: dict[str, Any]) -> str:
     else:
         lines.append("DNS/security context was unavailable, so this briefing is based on telemetry only.")
 
-    lines.extend(["", "## What Can Be Safely Ignored?", ""])
+    lines.extend(["", "## Lower Priority / No Action Suggested", ""])
     if not sustained_count:
-        lines.append("Isolated raw spikes can be ignored for now because they did not form a sustained bad streak.")
+        lines.append("No action suggested for isolated raw spikes unless symptoms were reported, because they did not form a sustained bad streak.")
     else:
-        lines.append("Calm buckets and isolated raw spikes outside sustained intervals can be ignored unless users reported symptoms at those exact times.")
+        lines.append("No action suggested for calm buckets or isolated raw spikes outside sustained intervals unless symptoms were reported at those exact times.")
     if pattern.get("label") == "Better than usual for this time of day":
-        lines.append("The latest baseline comparison was better than usual, so elevated-baseline concern can be ignored for this run.")
+        lines.append("The latest baseline comparison was better than usual, so no action is suggested for elevated-baseline concern in this run.")
     elif pattern.get("label") == "Normal for this time of day":
         lines.append("The latest baseline comparison was normal for this time of day.")
 

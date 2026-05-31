@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
 from .analyze import analyze
 from .brief import render_brief, report_date, write_reports
-from .ingest import DEFAULT_CSV, DEFAULT_DNS, load_inputs
+from .ingest import DEFAULT_CSV, DEFAULT_DNS, CsvSchemaError, load_inputs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,8 +25,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     dns_path = Path(args.dns) if args.dns else None
-    observations, dns, start, end = load_inputs(args.csv, dns_path, args.window_hours)
-    analysis = analyze(observations, dns, start, end)
+    try:
+        ingest_result, dns, start, end = load_inputs(args.csv, dns_path, args.window_hours)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        return 2
+    except (OSError, csv.Error, UnicodeDecodeError, CsvSchemaError) as exc:
+        print(f"Error: Could not read Prime Observer CSV export: {exc}")
+        return 2
+
+    analysis = analyze(
+        ingest_result.observations,
+        dns,
+        start,
+        end,
+        warnings=ingest_result.warnings,
+        ignored_hosts=ingest_result.ignored_hosts,
+    )
     markdown = render_brief(analysis)
     dated, latest = write_reports(markdown, args.reports_dir, report_date(analysis))
     print(f"Wrote {dated}")
@@ -35,4 +51,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
