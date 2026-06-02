@@ -42,7 +42,7 @@ def repeated_isolated_instability(analysis: dict[str, Any]) -> bool:
 
 
 def status_label(analysis: dict[str, Any]) -> str:
-    attribution = analysis["attribution"]
+    attribution = analysis.get("report_attribution") or analysis["attribution"]
     if analysis["wan_health"].get("samples", 0) == 0:
         return "Watch"
     if analysis["sustained_buckets"]:
@@ -63,14 +63,14 @@ def status_label(analysis: dict[str, Any]) -> str:
 def issue_location(analysis: dict[str, Any]) -> str:
     if status_label(analysis) == "Healthy":
         return ""
-    label = analysis["attribution"].get("label", "")
+    label = (analysis.get("report_attribution") or analysis["attribution"]).get("label", "")
     if label == "Likely local LAN / Wi-Fi":
         return "Likely local Wi-Fi/router issue"
     if label == "Likely upstream ISP / path":
         return "Likely upstream/ISP issue"
-    if label == "No recent issue detected":
-        return "Unclear source"
-    return "Unclear source"
+    if label in {"No recent issue detected", "No issue detected"}:
+        return "No clear source identified"
+    return "No clear source identified"
 
 
 def main_summary(analysis: dict[str, Any]) -> str:
@@ -94,6 +94,36 @@ def main_summary(analysis: dict[str, Any]) -> str:
     return "Everything looked normal yesterday."
 
 
+def status_reason(analysis: dict[str, Any]) -> str:
+    status = status_label(analysis)
+    sustained = len(analysis["sustained_buckets"])
+    turbulence = len(analysis["turbulence_buckets"])
+    raw_spikes = len(analysis["raw_spikes"])
+    location = issue_location(analysis)
+
+    if analysis["wan_health"].get("samples", 0) == 0:
+        return "Core Signal could not make a normal judgment because usable internet telemetry was missing."
+    if status == "Healthy":
+        if raw_spikes:
+            return "No meaningful instability was detected. The brief blips were isolated, no issue source was identified, and no action is recommended."
+        return "No meaningful instability was detected, no issue source was identified, and no action is recommended."
+    if status == "Attention":
+        if sustained:
+            if issue_location(analysis) == "No clear source identified":
+                return "Sustained slowdown was detected, which means user impact was possible. The slowdown was real, but the available evidence does not clearly point to either local Wi-Fi/router or upstream ISP."
+            return "Sustained slowdown was detected, which means user impact was possible. Investigation is recommended if symptoms matched the affected time."
+        if location == "Likely local Wi-Fi/router issue":
+            return "The local Wi-Fi/router signal was strong enough to make user impact possible. Investigation is recommended if people noticed symptoms."
+        return "The evidence was strong enough that user impact was possible. Investigation is recommended if symptoms matched the affected time."
+    if turbulence:
+        return "Brief instability repeated enough to be noteworthy, but it was not actionable because no sustained slowdown was detected."
+    if repeated_isolated_instability(analysis):
+        return "Brief instability repeated enough to be noteworthy, but it was not actionable because the events did not continue long enough to suggest user impact."
+    if notable_baseline_slowdown(analysis):
+        return "Performance was noticeably different from historical norms, but it was not actionable because no sustained instability or user-impacting issue was detected."
+    return "Something was notable enough to watch, but no sustained instability or user-impacting issue was detected."
+
+
 def recommended_action(analysis: dict[str, Any]) -> str:
     status = status_label(analysis)
     location = issue_location(analysis)
@@ -106,6 +136,32 @@ def recommended_action(analysis: dict[str, Any]) -> str:
     if location == "Likely upstream/ISP issue":
         return "No home-network change is suggested. Check provider status or contact the ISP only if symptoms matched the affected time."
     return "Check whether symptoms matched the affected time. If this repeats, compare it with what people were doing."
+
+
+def source_evidence_note(analysis: dict[str, Any]) -> str | None:
+    status = status_label(analysis)
+    if status == "Healthy":
+        return None
+    attribution = analysis.get("report_attribution") or {}
+    label = attribution.get("label")
+    if label == "Likely local LAN / Wi-Fi":
+        return "Issue source evidence: local gateway evidence was persistently elevated."
+    if label == "Likely upstream ISP / path":
+        return "Issue source evidence: internet-side degradation with local gateway stable."
+    if status == "Attention":
+        return "Issue source evidence: slowdown confirmed, source not clear from available local vs internet signals."
+    return None
+
+
+def attribution_source_note(analysis: dict[str, Any]) -> str:
+    source = (analysis.get("report_attribution") or {}).get("source")
+    if source == "prime_observer_incident":
+        return "Attribution source: Prime Observer incident attribution"
+    if source == "prime_observer_window":
+        return "Attribution source: Prime Observer window attribution"
+    if source == "prime_observer_current":
+        return "Attribution source: Prime Observer current attribution"
+    return "Attribution source: Core Signal fallback"
 
 
 def pattern_note(pattern: dict[str, Any]) -> str | None:
@@ -121,6 +177,36 @@ def pattern_note(pattern: dict[str, Any]) -> str | None:
     return None
 
 
+def performance_context_note(analysis: dict[str, Any]) -> str | None:
+    note = pattern_note(analysis["pattern"])
+    if note == "Performance was better than usual for this time of day." and analysis["sustained_buckets"]:
+        return "Outside those periods, performance was better than usual for this time of day."
+    return note
+
+
+def stability_note(analysis: dict[str, Any]) -> str:
+    sustained = len(analysis["sustained_buckets"])
+    turbulence = len(analysis["turbulence_buckets"])
+    if sustained:
+        return f"{sustained} sustained slowdown period(s) were found."
+    if turbulence:
+        return "Brief instability happened, but it was not sustained."
+    return "No sustained slowdowns were found."
+
+
+def attribution_note(analysis: dict[str, Any]) -> str | None:
+    if status_label(analysis) == "Healthy":
+        return None
+    location = issue_location(analysis)
+    if location == "Likely upstream/ISP issue":
+        return "Evidence points to an upstream/ISP issue."
+    if location == "Likely local Wi-Fi/router issue":
+        return "Evidence points to a local Wi-Fi/router issue."
+    if location == "No clear source identified" and analysis["sustained_buckets"]:
+        return "The source was not clear from the available local-vs-internet evidence."
+    return None
+
+
 def dns_note(dns: dict[str, Any]) -> str:
     if not dns.get("available"):
         return "DNS filtering information was not available."
@@ -130,24 +216,39 @@ def dns_note(dns: dict[str, Any]) -> str:
 
 def worth_knowing(analysis: dict[str, Any]) -> list[str]:
     notes: list[str] = []
-    sustained = len(analysis["sustained_buckets"])
-    turbulence = len(analysis["turbulence_buckets"])
+    status = status_label(analysis)
     raw_spikes = len(analysis["raw_spikes"])
+    perf = performance_context_note(analysis)
+    attribution = attribution_note(analysis)
+    stability = stability_note(analysis)
 
-    note = pattern_note(analysis["pattern"])
-    if note:
-        notes.append(note)
-
-    if sustained:
-        notes.append(f"{sustained} sustained slowdown period(s) were found.")
-    elif turbulence:
-        notes.append("Brief instability happened, but it was not sustained.")
+    if status == "Attention":
+        notes.append(stability)
+        if attribution:
+            notes.append(attribution)
+        if perf:
+            notes.append(perf)
+    elif status == "Watch":
+        if analysis["turbulence_buckets"]:
+            notes.append("Brief instability repeated enough to be worth noting.")
+        elif repeated_isolated_instability(analysis):
+            notes.append("Brief unstable moments repeated enough to be worth noting.")
+        elif notable_baseline_slowdown(analysis):
+            notes.append("Performance was slower than usual for this time of day.")
+        else:
+            notes.append(stability)
+        if attribution:
+            notes.append(attribution)
+        if perf and perf not in notes:
+            notes.append(perf)
     else:
-        notes.append("No sustained slowdowns were found.")
+        if perf:
+            notes.append(perf)
+        notes.append(stability)
 
-    if raw_spikes and not sustained and not repeated_isolated_instability(analysis):
+    if raw_spikes and not analysis["sustained_buckets"] and not repeated_isolated_instability(analysis):
         notes.append("A few brief blips were not operationally significant.")
-    elif raw_spikes and not sustained:
+    elif raw_spikes and not analysis["sustained_buckets"] and status != "Watch":
         notes.append("Brief unstable moments were lower priority; no action is suggested unless users noticed symptoms.")
 
     notes.append(dns_note(analysis["dns"]))
@@ -160,13 +261,43 @@ def worth_knowing(analysis: dict[str, Any]) -> list[str]:
     return notes
 
 
-def render_brief(analysis: dict[str, Any]) -> str:
-    date = report_date(analysis)
-    wan = analysis["wan_health"]
+def compact_evidence_lines(analysis: dict[str, Any]) -> list[str]:
     counts = analysis["sample_counts"]
     sustained_count = len(analysis["sustained_buckets"])
     turbulence_count = len(analysis["turbulence_buckets"])
     raw_spike_count = len(analysis["raw_spikes"])
+    lines = [
+        f"- Window: {fmt_ts(analysis.get('window_start'))} to {fmt_ts(analysis.get('window_end'))}",
+        f"- Internet samples: {counts['wan_points']}",
+        f"- Sustained slowdowns: {sustained_count}",
+        f"- Brief instability: {raw_spike_count} isolated crossings across {turbulence_count} turbulence buckets",
+    ]
+    note = source_evidence_note(analysis)
+    if note:
+        lines.append(f"- {note}")
+    lines.append(f"- {attribution_source_note(analysis)}")
+    lines.append("- Prime Observer policy: v0.4.1-aligned")
+    return lines
+
+
+def verbose_evidence_lines(analysis: dict[str, Any]) -> list[str]:
+    wan = analysis["wan_health"]
+    counts = analysis["sample_counts"]
+    lines = [
+        f"- Export rows: {counts['rows']}",
+        f"- Median p95 latency: {fmt_num(wan.get('median_p95_ms'), 1, ' ms')}",
+        f"- p95-of-p95 latency: {fmt_num(wan.get('p95_of_p95_ms'), 1, ' ms')}",
+        f"- Jitter 95th percentile: {fmt_num(wan.get('jitter_95_ms'), 1, ' ms')}",
+    ]
+    for phase, stats in analysis["wan_by_phase"].items():
+        lines.append(
+            f"- {phase}: {stats.get('samples', 0)} samples; sustained degradation rate {fmt_num(stats.get('bad_rate_pct'), 1, '%')}"
+        )
+    return lines
+
+
+def render_brief(analysis: dict[str, Any], verbose_evidence: bool = False) -> str:
+    date = report_date(analysis)
 
     lines: list[str] = [
         f"# Core Signal Morning Brief - {date}",
@@ -174,6 +305,9 @@ def render_brief(analysis: dict[str, Any]) -> str:
         f"Status: {status_label(analysis)}",
         "",
         main_summary(analysis),
+        "",
+        "Why This Status:",
+        status_reason(analysis),
         "",
     ]
 
@@ -189,26 +323,11 @@ def render_brief(analysis: dict[str, Any]) -> str:
         ]
     )
     lines.extend(f"- {note}" for note in worth_knowing(analysis))
-    lines.extend(
-        [
-            "",
-            "Technical Evidence:",
-            f"- Observation window: {fmt_ts(analysis.get('window_start'))} to {fmt_ts(analysis.get('window_end'))}",
-            f"- Samples analyzed: {counts['wan_points']} internet samples from {counts['rows']} export rows",
-            f"- Sustained degradation: {sustained_count}",
-            f"- Turbulence buckets: {turbulence_count}",
-            f"- Isolated threshold crossings: {raw_spike_count}",
-            f"- Median p95 latency: {fmt_num(wan.get('median_p95_ms'), 1, ' ms')}",
-            f"- p95-of-p95 latency: {fmt_num(wan.get('p95_of_p95_ms'), 1, ' ms')}",
-            f"- Jitter 95th percentile: {fmt_num(wan.get('jitter_95_ms'), 1, ' ms')}",
-            f"- Prime Observer policy: v0.4.1-aligned thresholds ({policy.WAN_BAD_P95_MS:.0f} ms p95, {policy.WAN_BAD_JITTER_MS:.0f} ms jitter, {policy.WAN_BAD_LOSS_PCT:.0f}% packet loss, {policy.WAN_BAD_PERSISTENCE} consecutive samples)",
-        ]
-    )
-
-    for phase, stats in analysis["wan_by_phase"].items():
-        lines.append(
-            f"- {phase}: {stats.get('samples', 0)} samples; sustained degradation rate {fmt_num(stats.get('bad_rate_pct'), 1, '%')}"
-        )
+    lines.extend(["", "Technical Evidence:"])
+    lines.extend(compact_evidence_lines(analysis))
+    if verbose_evidence:
+        lines.extend(["", "Verbose Evidence:"])
+        lines.extend(verbose_evidence_lines(analysis))
 
     if analysis.get("warnings") or analysis.get("ignored_hosts"):
         lines.append("- Data notes:")
