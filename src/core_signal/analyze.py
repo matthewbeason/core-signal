@@ -246,6 +246,157 @@ def attribution(wan: list[SeriesPoint], lan: list[SeriesPoint], end: dt.datetime
     }
 
 
+def report_attribution(
+    wan: list[SeriesPoint],
+    lan: list[SeriesPoint],
+    buckets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attribute the event-level evidence that a morning brief summarizes."""
+    wan_degraded = any(p.sustained_bad for p in wan) or any(b["is_turbulence"] for b in buckets)
+    lan_elevated = [p for p in lan if p.p95_ms > policy.LAN_ELEVATED_P95_MS]
+    lan_elevated_rate = len(lan_elevated) / len(lan) if lan else 0.0
+    lan_degraded = len(lan_elevated) >= 3 and lan_elevated_rate > 0.2
+
+    if not wan and not lan:
+        return {
+            "label": "No clear source identified",
+            "confidence": "Low",
+            "why": "No usable local or internet telemetry was available.",
+            "lan_elevated": 0,
+            "lan_samples": 0,
+        }
+    if lan_degraded:
+        return {
+            "label": "Likely local LAN / Wi-Fi",
+            "confidence": "Medium" if wan_degraded else "High",
+            "why": f"Local gateway evidence was persistently elevated ({len(lan_elevated)}/{len(lan)} samples).",
+            "lan_elevated": len(lan_elevated),
+            "lan_samples": len(lan),
+        }
+    if wan_degraded:
+        return {
+            "label": "Likely upstream ISP / path",
+            "confidence": "High",
+            "why": f"Internet-side degradation was detected while local gateway evidence stayed stable ({len(lan_elevated)}/{len(lan) or 0} elevated local samples).",
+            "lan_elevated": len(lan_elevated),
+            "lan_samples": len(lan),
+        }
+    return {
+        "label": "No issue detected",
+        "confidence": "High",
+        "why": "No sustained internet degradation and no persistent local gateway degradation were detected.",
+        "lan_elevated": len(lan_elevated),
+        "lan_samples": len(lan),
+        "source": "core_signal_fallback",
+    }
+
+
+def with_fallback_source(attribution_result: dict[str, Any]) -> dict[str, Any]:
+    out = dict(attribution_result)
+    out.setdefault("source", "core_signal_fallback")
+    return out
+
+
+def normalize_attribution_label(raw_label: str, raw_status: str) -> str:
+    label_key = raw_label.lower()
+    status_key = raw_status.lower()
+    if "local" in label_key or "wi-fi" in label_key or "wifi" in label_key or "lan" in label_key or status_key == "likely_local":
+        return "Likely local LAN / Wi-Fi"
+    if "upstream" in label_key or "isp" in label_key or "path" in label_key or status_key == "likely_upstream":
+        return "Likely upstream ISP / path"
+    if status_key in {"no_network_issue_detected", "no_issue_detected"} or "no network issue" in label_key:
+        return "No issue detected"
+    return "No clear source identified"
+
+
+def normalize_prime_observer_attribution_entry(entry: dict[str, Any], source: str) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    raw_label = str(entry.get("label") or entry.get("attribution_label") or "").strip()
+    raw_status = str(entry.get("status") or entry.get("attribution_status") or "").strip().lower()
+    confidence = str(entry.get("confidence") or entry.get("attribution_confidence") or "Unknown").strip()
+    evidence = entry.get("evidence")
+    metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+    if isinstance(evidence, list):
+        summary = "; ".join(str(item) for item in evidence if item)
+    elif isinstance(entry.get("attribution_evidence"), dict):
+        summary = str(entry["attribution_evidence"].get("summary") or raw_label or "Prime Observer attribution export was present.").strip()
+        metrics = entry["attribution_evidence"]
+    else:
+        summary = str(entry.get("why") or raw_label or "Prime Observer attribution export was present.").strip()
+    return {
+        "label": normalize_attribution_label(raw_label, raw_status),
+        "confidence": confidence or "Unknown",
+        "why": summary,
+        "source": source,
+        "raw_status": raw_status,
+        "raw_label": raw_label,
+        "generated_at": entry.get("generated_at"),
+        "evidence": evidence,
+        "metrics": metrics,
+    }
+
+
+def select_incident_attribution(incidents: Any) -> dict[str, Any] | None:
+    if not isinstance(incidents, list) or not incidents:
+        return None
+    normalized = [
+        item
+        for item in (
+            normalize_prime_observer_attribution_entry(incident, "prime_observer_incident")
+            for incident in incidents
+        )
+        if item is not None
+    ]
+    if not normalized:
+        return None
+    for label in ("Likely upstream ISP / path", "Likely local LAN / Wi-Fi"):
+        matches = [item for item in normalized if item["label"] == label]
+        if matches:
+            chosen = dict(matches[0])
+            chosen["incident_count"] = len(normalized)
+            return chosen
+    chosen = dict(normalized[0])
+    chosen["incident_count"] = len(normalized)
+    return chosen
+
+
+def normalize_exported_attribution(
+    exported: dict[str, Any] | None,
+    sustained_count: int = 0,
+) -> dict[str, Any] | None:
+    if not isinstance(exported, dict):
+        return None
+
+    if sustained_count:
+        incident = select_incident_attribution(exported.get("incidents"))
+        if incident is not None:
+            return incident
+
+    window = normalize_prime_observer_attribution_entry(
+        exported.get("window_attribution"),
+        "prime_observer_window",
+    )
+    if window is not None:
+        return window
+
+    current = normalize_prime_observer_attribution_entry(
+        exported.get("current_attribution"),
+        "prime_observer_current",
+    )
+    if current is not None:
+        return current
+
+    legacy = {
+        "attribution_label": exported.get("attribution_label"),
+        "attribution_status": exported.get("attribution_status"),
+        "attribution_confidence": exported.get("attribution_confidence"),
+        "attribution_evidence": exported.get("attribution_evidence"),
+        "generated_at": exported.get("generated_at"),
+    }
+    return normalize_prime_observer_attribution_entry(legacy, "prime_observer_current")
+
+
 def dns_context(dns: dict[str, Any] | None, end: dt.datetime | None) -> dict[str, Any]:
     if not dns or dns.get("status") != "ok" or not isinstance(dns.get("summary"), dict):
         return {"available": False, "summary": "DNS/security context unavailable."}
@@ -275,6 +426,7 @@ def dns_context(dns: dict[str, Any] | None, end: dt.datetime | None) -> dict[str
 def analyze(
     observations: list[Observation],
     dns: dict[str, Any] | None = None,
+    exported_attribution: dict[str, Any] | None = None,
     start: dt.datetime | None = None,
     end: dt.datetime | None = None,
     warnings: list[str] | None = None,
@@ -293,6 +445,8 @@ def analyze(
     sustained_buckets = [b for b in buckets if b["is_sustained"]]
     turbulence_buckets = [b for b in buckets if b["is_turbulence"]]
     raw_spikes = [p for p in wan if p.raw_bad and not p.sustained_bad]
+    fallback_report_attribution = with_fallback_source(report_attribution(wan, lan, buckets))
+    exported_report_attribution = normalize_exported_attribution(exported_attribution, len(sustained_buckets))
 
     return {
         "window_start": start,
@@ -306,6 +460,8 @@ def analyze(
         "wan_by_phase": {phase: stats_for(points) for phase, points in sorted(by_phase.items())},
         "pattern": pattern_context(wan),
         "attribution": attribution(wan, lan, end),
+        "report_attribution": exported_report_attribution or fallback_report_attribution,
+        "fallback_report_attribution": fallback_report_attribution,
         "buckets": buckets,
         "sustained_buckets": sustained_buckets,
         "turbulence_buckets": turbulence_buckets,
