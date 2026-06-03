@@ -14,6 +14,7 @@ from .ingest import (
     CsvSchemaError,
     load_pattern_history,
     load_inputs,
+    read_dns_summary,
 )
 from .patterns import (
     analyze_patterns,
@@ -99,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
                 "warnings": history.ingest.warnings,
                 "ignored_hosts": history.ingest.ignored_hosts,
             },
+            dns=read_dns_summary(dns_path),
         )
         markdown = render_pattern_report(analysis)
         dated, latest = write_pattern_reports(markdown, args.patterns_dir, pattern_report_date(analysis))

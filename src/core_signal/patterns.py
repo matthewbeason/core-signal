@@ -33,6 +33,21 @@ class PatternFinding:
     approaching_signature: bool
 
 
+@dataclass(frozen=True)
+class ConcentrationSignal:
+    signal_kind: str
+    entity_label: str
+    entity_type: str
+    name: str | None
+    name_redacted: bool
+    count: int
+    total: int
+    share_pct: float
+    dominance_ratio: float | None
+    persistence: str
+    confidence: str
+
+
 def minute_of_day(ts: dt.datetime) -> int:
     return ts.hour * 60 + ts.minute
 
@@ -548,7 +563,164 @@ def discovered_elevated_window(wan: list[SeriesPoint], existing_names: set[str])
     )
 
 
-def analyze_patterns(observations: list[Observation], history: dict[str, Any] | None = None) -> dict[str, Any]:
+def int_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def float_value(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def share_to_pct(value: Any) -> float | None:
+    number = float_value(value)
+    if number is None:
+        return None
+    if number <= 1.0:
+        return number * 100.0
+    return number
+
+
+def concentration_confidence(share_pct: float, dominance_ratio: float | None, persistence_available: bool) -> str:
+    if persistence_available and (share_pct >= 20 or (dominance_ratio is not None and dominance_ratio >= 5)):
+        return "High"
+    if share_pct >= 20 or (dominance_ratio is not None and dominance_ratio >= 5):
+        return "Medium"
+    return "Low"
+
+
+def concentration_threshold_met(share_pct: float | None, dominance_ratio: float | None) -> bool:
+    return (share_pct is not None and share_pct >= 20.0) or (
+        dominance_ratio is not None and dominance_ratio >= 5.0
+    )
+
+
+def top_entity_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
+    top_entities = summary.get("top_entities")
+    if not isinstance(top_entities, list) or not top_entities:
+        return None
+
+    first = next((row for row in top_entities if isinstance(row, dict)), None)
+    if first is None:
+        return None
+
+    label = str(first.get("label") or first.get("name") or "entity_1").strip() or "entity_1"
+    redacted = bool(first.get("name_redacted"))
+    raw_name = str(first.get("name") or "").strip()
+    name = None if redacted or not raw_name else raw_name
+    count = int_value(first.get("count"))
+    share_pct = share_to_pct(first.get("share_of_total"))
+    if share_pct is None:
+        share_pct = share_to_pct(summary.get("top_entity_share"))
+    dominance = float_value(first.get("dominance_ratio"))
+    if dominance is None:
+        dominance = float_value(summary.get("top_entity_dominance_ratio"))
+    total = int_value(summary.get("total_queries"))
+    if total <= 0 and count > 0 and share_pct and share_pct > 0:
+        total = int(round(count / (share_pct / 100.0)))
+
+    if count <= 0 or share_pct is None or not concentration_threshold_met(share_pct, dominance):
+        return None
+
+    return ConcentrationSignal(
+        signal_kind="dns_entity",
+        entity_label=label,
+        entity_type="DNS entity",
+        name=name,
+        name_redacted=redacted,
+        count=count,
+        total=total,
+        share_pct=share_pct,
+        dominance_ratio=dominance,
+        persistence="Not evaluated; only the current safe DNS summary is available.",
+        confidence=concentration_confidence(share_pct, dominance, persistence_available=False),
+    )
+
+
+def top_reason_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
+    top_reasons = summary.get("top_reasons")
+    if not isinstance(top_reasons, list):
+        return None
+
+    peers: list[tuple[str, int]] = []
+    for row in top_reasons:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        count = int_value(row.get("queries"))
+        if name and count > 0:
+            peers.append((name, count))
+
+    if not peers:
+        return None
+
+    peers.sort(key=lambda item: (-item[1], item[0]))
+    top_name, top_count = peers[0]
+    next_count = peers[1][1] if len(peers) > 1 else 0
+    peer_total = sum(count for _, count in peers)
+    blocked_total = int_value(summary.get("blocked_queries"))
+    total = max(blocked_total, peer_total)
+    if total <= 0:
+        return None
+
+    share = min(100.0, 100.0 * top_count / total)
+    dominance = (top_count / next_count) if next_count > 0 else None
+    if share < 50 or (dominance is not None and dominance < 2):
+        return None
+
+    return ConcentrationSignal(
+        signal_kind="blocked_reason",
+        entity_label=top_name,
+        entity_type="Blocked DNS reason",
+        name=top_name,
+        name_redacted=False,
+        count=top_count,
+        total=total,
+        share_pct=share,
+        dominance_ratio=dominance,
+        persistence="Not evaluated; only the current safe DNS summary is available.",
+        confidence=concentration_confidence(share, dominance, persistence_available=False),
+    )
+
+
+def analyze_concentration(dns: dict[str, Any] | None) -> dict[str, Any]:
+    if not dns or dns.get("status") != "ok" or not isinstance(dns.get("summary"), dict):
+        return {
+            "signals": [],
+            "message": "No concentration signals were evaluated because the available exported summaries do not include safe top-N entity data.",
+        }
+
+    summary = dns["summary"]
+    if not isinstance(summary.get("top_entities"), list) and not isinstance(summary.get("top_reasons"), list):
+        return {
+            "signals": [],
+            "message": "No concentration signals were evaluated because the available exported summaries do not include safe top-N entity data.",
+        }
+
+    entity = top_entity_signal(summary)
+    if entity is not None:
+        return {"signals": [entity], "message": None}
+
+    reason = top_reason_signal(summary)
+    if reason is not None:
+        return {"signals": [reason], "message": None}
+
+    return {
+        "signals": [],
+        "message": "No concentration signal met the deterministic threshold in the available safe exported summaries.",
+    }
+
+
+def analyze_patterns(
+    observations: list[Observation],
+    history: dict[str, Any] | None = None,
+    dns: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     lan, wan = collapse_series(observations)
     findings: list[PatternFinding] = []
     support_notes: list[str] = []
@@ -597,6 +769,7 @@ def analyze_patterns(observations: list[Observation], history: dict[str, Any] | 
         "wan_summary": point_stats(wan),
         "lan_summary": point_stats(lan),
         "findings": findings,
+        "concentration": analyze_concentration(dns),
         "support_notes": support_notes,
         "history": history,
     }
@@ -616,6 +789,70 @@ def confidence_line(finding: PatternFinding) -> str:
         f"magnitude {inputs['magnitude_points']}/3, sample size {inputs['sample_points']}/3, "
         f"duration {inputs['duration_points']}/3; total {inputs['total_points']}/15"
     )
+
+
+def render_concentration_section(concentration: dict[str, Any]) -> list[str]:
+    lines = ["## Concentration Signals", ""]
+    signals: list[ConcentrationSignal] = concentration.get("signals") or []
+    if not signals:
+        lines.extend([concentration.get("message") or "No concentration signal met the deterministic threshold.", ""])
+        return lines
+
+    for signal in signals:
+        ratio = "n/a" if signal.dominance_ratio is None else f"{signal.dominance_ratio:.1f}x"
+        if signal.signal_kind == "dns_entity":
+            display_name = signal.name or signal.entity_label
+            name_line = (
+                "Name: redacted by Prime Observer privacy settings"
+                if signal.name_redacted
+                else f"Name: {display_name}"
+            )
+            context_line = (
+                "The entity name is redacted by Prime Observer's privacy-safe export."
+                if signal.name_redacted
+                else "This may be intentional, but it is concentrated compared with other exported DNS entities."
+            )
+            review_line = (
+                "Review is only useful if you intentionally reveal or inspect the entity locally."
+                if signal.name_redacted
+                else "Review recommended only if this concentration is unexpected."
+            )
+            lines.extend(
+                [
+                    f"### Concentration: DNS entity {display_name}",
+                    "",
+                    f"- Entity label: {signal.entity_label}",
+                    f"- Entity type: {signal.entity_type}",
+                    f"- {name_line}",
+                    f"- Count: {signal.count}",
+                    f"- Share of total DNS activity: {pct(signal.share_pct)}",
+                    f"- Dominance ratio vs next peer: {ratio}",
+                    f"- Persistence: {signal.persistence}",
+                    f"- Confidence: {signal.confidence}",
+                    f"- A single DNS entity represented {pct(signal.share_pct)} of total DNS activity.",
+                    f"- {context_line}",
+                    f"- {review_line}",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"### Concentration: {signal.entity_label} block reason",
+                    "",
+                    f"- Entity type: {signal.entity_type}",
+                    f"- Count: {signal.count}",
+                    f"- Share of available blocked-reason activity: {pct(signal.share_pct)}",
+                    f"- Dominance ratio vs next peer: {ratio}",
+                    f"- Persistence: {signal.persistence}",
+                    f"- Confidence: {signal.confidence}",
+                    f"- {signal.entity_label} represented {pct(signal.share_pct)} of available blocked-reason activity.",
+                    "- This may be intentional, but it is highly concentrated compared with other exported reasons.",
+                    "- Review recommended only if this concentration is unexpected.",
+                    "",
+                ]
+            )
+    return lines
 
 
 def render_pattern_report(analysis: dict[str, Any]) -> str:
@@ -669,6 +906,8 @@ def render_pattern_report(analysis: dict[str, Any]) -> str:
         lines.append("- Possible explanations:")
         lines.extend(f"  - {item}" for item in finding.possible_explanations)
         lines.append("")
+
+    lines.extend(render_concentration_section(analysis.get("concentration") or {}))
 
     lines.extend(
         [
