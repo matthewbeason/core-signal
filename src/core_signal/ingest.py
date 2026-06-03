@@ -11,7 +11,9 @@ from . import policy
 
 
 DEFAULT_CSV = Path("/Users/mbeason/prime-observer/viz/latest.csv")
+DEFAULT_HISTORY_DIR = Path("/Users/mbeason/prime-observer/data")
 DEFAULT_DNS = Path("/Users/mbeason/prime-observer/viz/nextdns_summary.json")
+DEFAULT_ATTRIBUTION = Path("/Users/mbeason/prime-observer/viz/network_attribution.json")
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,17 @@ class IngestResult:
     observations: list[Observation]
     warnings: list[str]
     ignored_hosts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class HistoryIngestResult:
+    ingest: IngestResult
+    source_files: list[Path]
+    files_available: int
+    history_dir: Path
+    requested_days: int
+    window_start: dt.datetime | None
+    window_end: dt.datetime | None
 
 
 class CsvSchemaError(ValueError):
@@ -118,6 +131,75 @@ def read_observations(csv_path: Path) -> IngestResult:
     return IngestResult(observations, warnings, ignored_hosts)
 
 
+def history_files(history_dir: Path) -> list[Path]:
+    if not history_dir.exists():
+        raise FileNotFoundError(f"Prime Observer history directory not found: {history_dir}")
+    return sorted(
+        path
+        for path in history_dir.glob("bakeoff_*.csv")
+        if path.stem.removeprefix("bakeoff_").isdigit()
+    )
+
+
+def merge_ignored_hosts(results: list[IngestResult]) -> dict[str, int]:
+    ignored: dict[str, int] = {}
+    for result in results:
+        for host, count in result.ignored_hosts.items():
+            ignored[host] = ignored.get(host, 0) + count
+    return ignored
+
+
+def load_pattern_history(
+    history_dir: Path = DEFAULT_HISTORY_DIR,
+    history_days: int = 30,
+) -> HistoryIngestResult:
+    if history_days <= 0:
+        raise ValueError("history_days must be greater than zero")
+
+    files = history_files(history_dir)
+    if not files:
+        raise FileNotFoundError(f"No Prime Observer bakeoff CSV files found in: {history_dir}")
+
+    per_file: list[tuple[Path, IngestResult]] = [(path, read_observations(path)) for path in files]
+    all_observations = [obs for _, result in per_file for obs in result.observations]
+    if not all_observations:
+        return HistoryIngestResult(
+            ingest=IngestResult([], [f"No usable telemetry found in {history_dir}."], merge_ignored_hosts([result for _, result in per_file])),
+            source_files=[],
+            files_available=len(files),
+            history_dir=history_dir,
+            requested_days=history_days,
+            window_start=None,
+            window_end=None,
+        )
+
+    end = max(obs.ts for obs in all_observations)
+    start = end - dt.timedelta(days=history_days)
+    filtered: list[Observation] = []
+    source_files: list[Path] = []
+    warnings: list[str] = []
+    kept_results: list[IngestResult] = []
+
+    for path, result in per_file:
+        kept = [obs for obs in result.observations if start <= obs.ts <= end]
+        if kept:
+            source_files.append(path)
+            filtered.extend(kept)
+            warnings.extend(result.warnings)
+            kept_results.append(result)
+
+    actual_start = min((obs.ts for obs in filtered), default=None)
+    return HistoryIngestResult(
+        ingest=IngestResult(filtered, sorted(set(warnings)), merge_ignored_hosts(kept_results)),
+        source_files=source_files,
+        files_available=len(files),
+        history_dir=history_dir,
+        requested_days=history_days,
+        window_start=actual_start,
+        window_end=end if filtered else None,
+    )
+
+
 def latest_window(
     observations: list[Observation],
     hours: int = 24,
@@ -129,21 +211,36 @@ def latest_window(
     return [o for o in observations if start <= o.ts <= end], start, end
 
 
-def read_dns_summary(dns_path: Path | None) -> dict[str, Any] | None:
-    if dns_path is None or not dns_path.exists():
+def read_json_file(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
         return None
     try:
-        with dns_path.open("r") as f:
+        with path.open("r") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
 
 
+def read_dns_summary(dns_path: Path | None) -> dict[str, Any] | None:
+    return read_json_file(dns_path)
+
+
+def read_network_attribution(attribution_path: Path | None) -> dict[str, Any] | None:
+    return read_json_file(attribution_path)
+
+
 def load_inputs(
     csv_path: Path = DEFAULT_CSV,
     dns_path: Path | None = DEFAULT_DNS,
+    attribution_path: Path | None = DEFAULT_ATTRIBUTION,
     window_hours: int = 24,
-) -> tuple[IngestResult, dict[str, Any] | None, dt.datetime | None, dt.datetime | None]:
+) -> tuple[IngestResult, dict[str, Any] | None, dict[str, Any] | None, dt.datetime | None, dt.datetime | None]:
     result = read_observations(csv_path)
     window, start, end = latest_window(result.observations, window_hours)
-    return IngestResult(window, result.warnings, result.ignored_hosts), read_dns_summary(dns_path), start, end
+    return (
+        IngestResult(window, result.warnings, result.ignored_hosts),
+        read_dns_summary(dns_path),
+        read_network_attribution(attribution_path),
+        start,
+        end,
+    )

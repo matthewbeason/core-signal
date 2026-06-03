@@ -10,15 +10,16 @@ mattered in the most recent 24-hour observation window.
 
 Prime Observer already captures the measurements: WAN latency, jitter, packet
 loss, historical baseline context, and optional DNS/security summaries. Core
-Signal exists to turn those observations into a short operational note:
+Signal exists to turn those observations into local interpretation:
 
 - what happened
 - what was unusual
 - what deserves attention
 - what does not need action unless symptoms were reported
+- what recurring rhythms may be emerging across history
 
 It is intentionally not another dashboard. It produces readable Markdown that
-can be reviewed locally or archived as daily reports.
+can be reviewed locally or archived as daily and weekly reports.
 
 ## Relationship To Prime Observer
 
@@ -34,12 +35,14 @@ Core Signal v0.1 is intentionally narrow:
 - standard library only at runtime
 - no dashboards, databases, web scraping, external APIs, LLMs, or agent frameworks
 - graceful handling when optional DNS context is missing
+- observed recurring patterns only; no formal signature library yet
 
 ## Inputs
 
 By default Core Signal reads:
 
 - `/Users/mbeason/prime-observer/viz/latest.csv`
+- `/Users/mbeason/prime-observer/data/bakeoff_YYYYMMDD.csv` for pattern reports
 - `/Users/mbeason/prime-observer/viz/nextdns_summary.json` when present
 
 The DNS summary is optional. Missing or invalid DNS context does not prevent a
@@ -51,6 +54,11 @@ Briefings are written to:
 
 - `reports/YYYY-MM-DD-morning-brief.md`
 - `reports/latest.md`
+
+Pattern reports are written to:
+
+- `reports/patterns/YYYY-MM-DD-pattern-report.md`
+- `reports/patterns/latest.md`
 
 The report date is based on the newest telemetry timestamp found in the Prime
 Observer export.
@@ -93,6 +101,25 @@ Skip DNS context:
 
 ```bash
 PYTHONPATH=src python3 -m core_signal.cli --dns ""
+```
+
+Generate a long-horizon pattern report:
+
+```bash
+PYTHONPATH=src python3 -m core_signal.cli \
+  --pattern-report \
+  --history-dir /Users/mbeason/prime-observer/data \
+  --history-days 30
+```
+
+With explicit history and pattern output directories:
+
+```bash
+PYTHONPATH=src python3 -m core_signal.cli \
+  --pattern-report \
+  --history-dir /Users/mbeason/prime-observer/data \
+  --history-days 30 \
+  --patterns-dir reports/patterns
 ```
 
 Run tests:
@@ -156,6 +183,77 @@ The LaunchAgent does not run at install time. It is scheduled for the next daily
 ```bash
 PYTHONPATH=src python3 -m core_signal.cli
 ```
+
+## Weekly Pattern Report LaunchAgent
+
+Core Signal can also install a separate user LaunchAgent that runs the pattern
+report weekly on Sunday at 7:00 AM. This is separate from the daily morning
+briefing and writes only to `reports/patterns/`.
+
+Preview the generated plist:
+
+```bash
+./scripts/setup_pattern_launchagent.sh print-plist
+```
+
+Install and load the LaunchAgent:
+
+```bash
+./scripts/setup_pattern_launchagent.sh install
+```
+
+Check status:
+
+```bash
+./scripts/setup_pattern_launchagent.sh status
+```
+
+Remove the LaunchAgent:
+
+```bash
+./scripts/setup_pattern_launchagent.sh uninstall
+```
+
+The plist is installed at:
+
+```text
+~/Library/LaunchAgents/com.mbeason.core-signal.pattern-report.plist
+```
+
+Logs are written to:
+
+```text
+logs/pattern-launchagent.out.log
+logs/pattern-launchagent.err.log
+```
+
+If Python lives somewhere other than `/opt/homebrew/bin/python3`, install with:
+
+```bash
+PYTHON_BIN=/path/to/python3 ./scripts/setup_pattern_launchagent.sh install
+```
+
+The pattern LaunchAgent does not run at install time. It is scheduled for the
+next Sunday 7:00 AM run. To test pattern generation immediately, run:
+
+```bash
+PYTHONPATH=src python3 -m core_signal.cli \
+  --pattern-report \
+  --history-dir /Users/mbeason/prime-observer/data \
+  --history-days 30
+```
+
+## Patterns And Signatures
+
+Pattern reports track observed recurring patterns: repeated telemetry behavior
+with accumulating evidence and deterministic Low, Medium, or High confidence.
+They are intentionally not diagnoses and do not assume root cause, application
+behavior, or user impact.
+
+A signature is a future concept: a mature recurring pattern with high
+confidence, stable timing and characteristics, enough recurrence, and sufficient
+history. This release does not promote patterns to signatures. It only reports
+whether an observed pattern is approaching that future status.
 
 ## Prime Observer Assumptions
 

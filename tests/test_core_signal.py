@@ -7,7 +7,15 @@ from pathlib import Path
 
 from core_signal.analyze import analyze
 from core_signal.brief import render_brief, report_date, write_reports
-from core_signal.ingest import CsvSchemaError, Observation, latest_window, read_dns_summary, read_observations
+from core_signal.ingest import (
+    CsvSchemaError,
+    Observation,
+    latest_window,
+    load_pattern_history,
+    read_dns_summary,
+    read_observations,
+)
+from core_signal.patterns import analyze_patterns, confidence_from_inputs, render_pattern_report, write_pattern_reports
 
 
 UTC = dt.timezone.utc
@@ -37,6 +45,26 @@ def obs(
 def worth_knowing_items(markdown: str) -> list[str]:
     section = markdown.split("Worth knowing:", 1)[1].split("Technical Evidence:", 1)[0]
     return [line.removeprefix("- ").strip() for line in section.splitlines() if line.startswith("- ")]
+
+
+def pattern_obs(day: int, hour: int, minute: int, host: str, p95: float, jitter: float = 5.0) -> Observation:
+    return Observation(
+        ts=dt.datetime(2026, 5, day, hour, minute, tzinfo=UTC),
+        phase="FIBER",
+        host=host,
+        p95_ms=p95,
+        jitter_ms=jitter,
+        loss_pct=0.0,
+    )
+
+
+def write_history_file(directory: Path, date: str, rows: list[tuple[str, str, float]]) -> Path:
+    path = directory / f"bakeoff_{date}.csv"
+    lines = ["ts,phase_label,host,p95_ms,jitter_ms,loss_pct\n"]
+    for timestamp, host, p95 in rows:
+        lines.append(f"{timestamp},FIBER,{host},{p95},5,0\n")
+    path.write_text("".join(lines))
+    return path
 
 
 class CoreSignalTests(unittest.TestCase):
@@ -69,6 +97,28 @@ class CoreSignalTests(unittest.TestCase):
         self.assertEqual(window, [recent])
         self.assertEqual(end, recent.ts)
         self.assertEqual(start, recent.ts - dt.timedelta(hours=24))
+
+    def test_pattern_history_is_bounded_by_telemetry_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            history_dir = Path(tmp)
+            write_history_file(
+                history_dir,
+                "20260501",
+                [
+                    ("2026-05-01T11:59:00+00:00", "1.1.1.1", 10),
+                    ("2026-05-01T12:30:00+00:00", "1.1.1.1", 20),
+                ],
+            )
+            write_history_file(history_dir, "20260502", [("2026-05-02T12:00:00+00:00", "1.1.1.1", 30)])
+            today = write_history_file(history_dir, "20260503", [("2026-05-03T12:00:00+00:00", "1.1.1.1", 40)])
+
+            result = load_pattern_history(history_dir, history_days=2)
+
+            self.assertEqual(result.window_end, dt.datetime(2026, 5, 3, 12, 0, tzinfo=UTC))
+            self.assertEqual(result.window_start, dt.datetime(2026, 5, 1, 12, 30, tzinfo=UTC))
+            self.assertEqual([obs.p95_ms for obs in result.ingest.observations], [20, 30, 40])
+            self.assertIn(today, result.source_files)
+            self.assertEqual(result.files_available, 3)
 
     def test_sustained_degradation_requires_two_consecutive_raw_bad_wan_points(self) -> None:
         rows = [
@@ -395,6 +445,107 @@ class CoreSignalTests(unittest.TestCase):
 
         unclear = analyze([], None)
         self.assertIn("Issue Location: No clear source identified", render_brief(unclear))
+
+    def test_pattern_confidence_requires_recurrence_and_duration(self) -> None:
+        confidence, inputs = confidence_from_inputs(
+            recurrence_count=1,
+            timing_consistency=1.0,
+            magnitude_pct=90.0,
+            sample_size=2000,
+            duration_days=1,
+        )
+        self.assertEqual(confidence, "Low")
+        self.assertEqual(inputs["total_points"], 9)
+
+    def test_pattern_confidence_is_capped_by_history_duration(self) -> None:
+        short_confidence, _ = confidence_from_inputs(
+            recurrence_count=10,
+            timing_consistency=1.0,
+            magnitude_pct=90.0,
+            sample_size=2000,
+            duration_days=13,
+        )
+        medium_confidence, _ = confidence_from_inputs(
+            recurrence_count=10,
+            timing_consistency=1.0,
+            magnitude_pct=90.0,
+            sample_size=2000,
+            duration_days=20,
+        )
+        full_confidence, _ = confidence_from_inputs(
+            recurrence_count=10,
+            timing_consistency=1.0,
+            magnitude_pct=90.0,
+            sample_size=2000,
+            duration_days=30,
+        )
+        self.assertEqual(short_confidence, "Low")
+        self.assertEqual(medium_confidence, "Medium")
+        self.assertEqual(full_confidence, "High")
+
+    def test_pattern_report_detects_morning_ramp_without_signature_promotion(self) -> None:
+        rows: list[Observation] = []
+        for day in (25, 26, 27):
+            rows.extend(
+                [
+                    pattern_obs(day, 7, 0, "1.1.1.1", 35),
+                    pattern_obs(day, 7, 0, "192.168.1.1", 15),
+                    pattern_obs(day, 9, 0, "1.1.1.1", 150, 55),
+                    pattern_obs(day, 9, 0, "192.168.1.1", 20),
+                    pattern_obs(day, 9, 5, "1.1.1.1", 155, 58),
+                    pattern_obs(day, 9, 5, "192.168.1.1", 20),
+                    pattern_obs(day, 9, 10, "1.1.1.1", 152, 54),
+                    pattern_obs(day, 9, 10, "192.168.1.1", 20),
+                    pattern_obs(day, 9, 15, "1.1.1.1", 158, 57),
+                    pattern_obs(day, 9, 15, "192.168.1.1", 20),
+                    pattern_obs(day, 12, 0, "1.1.1.1", 40),
+                    pattern_obs(day, 12, 0, "192.168.1.1", 15),
+                    pattern_obs(day, 14, 0, "1.1.1.1", 38),
+                    pattern_obs(day, 14, 0, "192.168.1.1", 15),
+                    pattern_obs(day, 20, 0, "1.1.1.1", 30),
+                    pattern_obs(day, 20, 0, "192.168.1.1", 15),
+                ]
+            )
+
+        analysis = analyze_patterns(rows)
+        markdown = render_pattern_report(analysis)
+        self.assertIn("Morning ramp around 08:30-11:30", markdown)
+        self.assertIn("Approaching signature status: No", markdown)
+        self.assertIn("not signatures or root-cause claims", markdown)
+
+    def test_pattern_report_writes_to_pattern_directory(self) -> None:
+        analysis = analyze_patterns(
+            [
+                pattern_obs(25, 9, 0, "1.1.1.1", 150, 55),
+                pattern_obs(25, 9, 0, "192.168.1.1", 20),
+                pattern_obs(25, 20, 0, "1.1.1.1", 30),
+                pattern_obs(25, 20, 0, "192.168.1.1", 15),
+            ]
+        )
+        markdown = render_pattern_report(analysis)
+        with tempfile.TemporaryDirectory() as tmp:
+            dated, latest = write_pattern_reports(markdown, Path(tmp) / "patterns", "2026-05-25")
+            self.assertEqual(dated.name, "2026-05-25-pattern-report.md")
+            self.assertEqual(latest.name, "latest.md")
+            self.assertIn("Core Signal Pattern Report", latest.read_text())
+
+    def test_pattern_report_renders_history_source_metadata(self) -> None:
+        analysis = analyze_patterns(
+            [pattern_obs(25, 9, 0, "1.1.1.1", 150, 55)],
+            history={
+                "history_dir": Path("/tmp/history"),
+                "requested_days": 30,
+                "files_available": 4,
+                "source_files": [Path("/tmp/history/bakeoff_20260525.csv")],
+                "window_start": dt.datetime(2026, 5, 25, 9, 0, tzinfo=UTC),
+                "window_end": dt.datetime(2026, 5, 25, 9, 0, tzinfo=UTC),
+            },
+        )
+        markdown = render_pattern_report(analysis)
+        self.assertIn("History directory: /tmp/history", markdown)
+        self.assertIn("Requested history window: 30 day(s)", markdown)
+        self.assertIn("History files read: 1 of 4 available bakeoff file(s)", markdown)
+        self.assertIn("Date range analyzed: 2026-05-25 09:00 UTC to 2026-05-25 09:00 UTC", markdown)
 
 
 if __name__ == "__main__":
