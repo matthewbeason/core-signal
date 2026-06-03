@@ -29,7 +29,7 @@ project. Core Signal treats Prime Observer as a read-only data source.
 Core Signal reads generated Prime Observer exports, but it does not modify Prime
 Observer files, restructure that repository, or introduce dependencies into it.
 
-Core Signal v0.1 is intentionally narrow:
+Core Signal is intentionally narrow:
 
 - deterministic Python
 - standard library only at runtime
@@ -39,14 +39,19 @@ Core Signal v0.1 is intentionally narrow:
 
 ## Inputs
 
-By default Core Signal reads:
+Morning briefings read:
 
 - `/Users/mbeason/prime-observer/viz/latest.csv`
-- `/Users/mbeason/prime-observer/data/bakeoff_YYYYMMDD.csv` for pattern reports
+- `/Users/mbeason/prime-observer/viz/nextdns_summary.json` when present
+- `/Users/mbeason/prime-observer/viz/network_attribution.json` when present
+
+Weekly pattern reports read:
+
+- `/Users/mbeason/prime-observer/data/bakeoff_YYYYMMDD.csv`
 - `/Users/mbeason/prime-observer/viz/nextdns_summary.json` when present
 
-The DNS summary is optional. Missing or invalid DNS context does not prevent a
-briefing from being generated.
+DNS and attribution exports are optional. Missing or invalid optional context
+does not prevent reports from being generated.
 
 ## Outputs
 
@@ -94,13 +99,15 @@ With explicit paths:
 PYTHONPATH=src python3 -m core_signal.cli \
   --csv /Users/mbeason/prime-observer/viz/latest.csv \
   --dns /Users/mbeason/prime-observer/viz/nextdns_summary.json \
+  --attribution /Users/mbeason/prime-observer/viz/network_attribution.json \
   --reports-dir reports
 ```
 
-Skip DNS context:
+Skip optional DNS or attribution context:
 
 ```bash
 PYTHONPATH=src python3 -m core_signal.cli --dns ""
+PYTHONPATH=src python3 -m core_signal.cli --attribution ""
 ```
 
 Generate a long-horizon pattern report:
@@ -255,10 +262,35 @@ confidence, stable timing and characteristics, enough recurrence, and sufficient
 history. This release does not promote patterns to signatures. It only reports
 whether an observed pattern is approaching that future status.
 
+Pattern reports use bounded historical Prime Observer telemetry from
+`data/bakeoff_YYYYMMDD.csv`. By default, `--history-days 30` analyzes the latest
+30 days based on telemetry timestamps, including today's file when present.
+
+## Attribution Export
+
+When `viz/network_attribution.json` is available, Core Signal uses Prime
+Observer's exported attribution for morning brief issue-location evidence. It
+prefers per-incident attribution for sustained slowdowns, then window-level
+attribution, then current attribution. If the export is missing or unusable,
+Core Signal falls back to its deterministic local attribution logic.
+
+## DNS Concentration Signals
+
+Weekly pattern reports can include DNS Concentration Signals when the optional
+`viz/nextdns_summary.json` export includes safe top-N summary data. Core Signal
+prefers privacy-safe `top_entities` concentration fields and falls back to
+blocked DNS reasons when entity concentration does not meet the deterministic
+threshold.
+
+Core Signal respects Prime Observer's privacy boundary. It does not read raw DNS
+logs, call the NextDNS API, expose client IPs or device names, or reveal full
+profile IDs. If Prime Observer redacts entity names, Core Signal reports the
+redacted label and explains that inspection must happen locally.
+
 ## Prime Observer Assumptions
 
-Core Signal v0.1 assumes Prime Observer exports rows shaped like
-`viz/latest.csv`:
+Core Signal assumes Prime Observer exports rows shaped like `viz/latest.csv` and
+`data/bakeoff_YYYYMMDD.csv`:
 
 - `ts` is ISO-8601 compatible and may include a timezone offset.
 - `host` identifies LAN/WAN targets.
@@ -272,12 +304,14 @@ Default target assumptions match Prime Observer v0.4.1:
 - LAN gateway: `192.168.1.1`
 - WAN targets: `1.1.1.1`, `9.9.9.9`
 
-Core Signal uses the newest telemetry timestamp in the CSV as the end of the
-briefing window, then analyzes the previous 24 hours of rows.
+For morning briefings, Core Signal uses the newest telemetry timestamp in
+`viz/latest.csv` as the end of the briefing window, then analyzes the previous
+24 hours of rows. For pattern reports, Core Signal reads historical bakeoff
+files and bounds the analysis by telemetry timestamps.
 
 ## Limitations
 
-Core Signal v0.1 is deliberately small:
+Core Signal is deliberately small:
 
 - It only reads Prime Observer telemetry exports.
 - It does not call external services.
