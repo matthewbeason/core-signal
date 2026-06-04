@@ -6,6 +6,12 @@ Prime Observer observes network behavior. Core Signal interprets the latest Prim
 Observer export and writes a concise Markdown morning briefing about what
 mattered in the most recent 24-hour observation window.
 
+Current status: active local-first reporting tool for Prime Observer exports.
+
+Portfolio context: Core Signal demonstrates deterministic local data
+interpretation, privacy-safe summary reporting, and scheduled macOS automation
+without cloud services, external APIs, or AI diagnosis.
+
 ## Why It Exists
 
 Prime Observer already captures the measurements: WAN latency, jitter, packet
@@ -82,8 +88,31 @@ Core Signal currently expects the Prime Observer repository to be available at:
 /Users/mbeason/prime-observer
 ```
 
-No Python package installation is required for v0.1. The runtime uses the Python
-standard library only.
+No Python package installation is required. The runtime uses the Python standard
+library only.
+
+## Quick Start
+
+From this repository, generate the default morning briefing:
+
+```bash
+PYTHONPATH=src python3 -m core_signal.cli
+```
+
+Run the test suite:
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests
+```
+
+Generate the weekly pattern report from the default Prime Observer history:
+
+```bash
+PYTHONPATH=src python3 -m core_signal.cli \
+  --pattern-report \
+  --history-dir /Users/mbeason/prime-observer/data \
+  --history-days 30
+```
 
 ## Usage
 
