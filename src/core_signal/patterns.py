@@ -44,6 +44,9 @@ class ConcentrationSignal:
     total: int
     share_pct: float
     dominance_ratio: float | None
+    share_label: str
+    observation: str
+    review: str
     persistence: str
     confidence: str
 
@@ -600,8 +603,177 @@ def concentration_threshold_met(share_pct: float | None, dominance_ratio: float 
     )
 
 
+def blocked_domain_threshold_met(share_pct: float | None, dominance_ratio: float | None) -> bool:
+    return (share_pct is not None and share_pct >= 35.0) or (
+        dominance_ratio is not None and dominance_ratio >= 5.0
+    )
+
+
+def entity_display_label(
+    name: str | None,
+    redacted: bool,
+    fallback_label: str,
+) -> str:
+    if redacted or not name:
+        return fallback_label
+    return name
+
+
+def top_entity_label(summary: dict[str, Any], count: int | None = None) -> str:
+    top_entities = summary.get("top_entities")
+    if not isinstance(top_entities, list):
+        return "entity_1"
+
+    for row in top_entities:
+        if not isinstance(row, dict):
+            continue
+        if count is not None and int_value(row.get("count")) != count:
+            continue
+        label = str(row.get("label") or "").strip()
+        if label:
+            return label
+    return "entity_1"
+
+
+def top_entity_dominance(summary: dict[str, Any], count: int | None = None) -> float | None:
+    top_entities = summary.get("top_entities")
+    if isinstance(top_entities, list):
+        for row in top_entities:
+            if not isinstance(row, dict):
+                continue
+            if count is not None and int_value(row.get("count")) != count:
+                continue
+            dominance = float_value(row.get("dominance_ratio"))
+            if dominance is not None:
+                return dominance
+    return float_value(summary.get("top_entity_dominance_ratio"))
+
+
+def domain_name(summary: dict[str, Any], key: str) -> tuple[str | None, bool]:
+    redacted = bool(summary.get(f"{key}_redacted"))
+    raw_name = str(summary.get(key) or "").strip()
+    return (None if redacted or not raw_name else raw_name, redacted)
+
+
+def total_domain_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
+    for field, label in (
+        ("top_queried_domain", "queried"),
+        ("top_resolved_domain", "resolved"),
+    ):
+        count = int_value(summary.get(f"{field}_count"))
+        share_pct = share_to_pct(summary.get(f"{field}_share_of_total"))
+        if share_pct is None:
+            share_pct = share_to_pct(summary.get(f"{field}_share"))
+        dominance = top_entity_dominance(summary, count=count)
+        if count <= 0 or share_pct is None or not concentration_threshold_met(share_pct, dominance):
+            continue
+
+        name, redacted = domain_name(summary, field)
+        entity_label = top_entity_label(summary, count=count) if redacted else (name or top_entity_label(summary, count=count))
+        total = int_value(summary.get("total_queries"))
+        if total <= 0 and share_pct > 0:
+            total = int(round(count / (share_pct / 100.0)))
+
+        display_name = entity_display_label(name, redacted, entity_label)
+        observation = (
+            "One redacted DNS domain accounted for an unusually large share of DNS activity."
+            if redacted
+            else "This domain accounted for an unusually large share of DNS activity."
+        )
+        return ConcentrationSignal(
+            signal_kind=f"dns_{label}_domain",
+            entity_label=entity_label,
+            entity_type="DNS domain",
+            name=name,
+            name_redacted=redacted,
+            count=count,
+            total=total,
+            share_pct=share_pct,
+            dominance_ratio=dominance,
+            share_label="Share of total DNS activity",
+            observation=observation,
+            review=(
+                "Review recommended locally if this concentration is unexpected."
+                if redacted
+                else "Review recommended to determine whether this concentration is intentional."
+            ),
+            persistence="Not evaluated; only the current safe DNS summary is available.",
+            confidence=concentration_confidence(share_pct, dominance, persistence_available=False),
+        )
+
+    return None
+
+
+def blocked_domain_dominance(summary: dict[str, Any], count: int | None = None) -> float | None:
+    for key in ("top_blocked_domains", "blocked_top_domains", "top_domains"):
+        rows = summary.get(key)
+        if not isinstance(rows, list):
+            continue
+        domain_rows = [row for row in rows if isinstance(row, dict)]
+        if not domain_rows:
+            continue
+        first = domain_rows[0]
+        if count is not None and int_value(first.get("count") or first.get("query_count")) != count:
+            continue
+        dominance = float_value(first.get("dominance_ratio"))
+        if dominance is not None:
+            return dominance
+        if len(domain_rows) > 1:
+            first_count = int_value(first.get("count") or first.get("query_count"))
+            second_count = int_value(domain_rows[1].get("count") or domain_rows[1].get("query_count"))
+            if first_count > 0 and second_count > 0:
+                return first_count / second_count
+    return None
+
+
+def blocked_domain_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
+    count = int_value(summary.get("top_blocked_domain_count"))
+    share_pct = share_to_pct(
+        summary.get("top_blocked_domain_share_of_blocked", summary.get("top_blocked_domain_share"))
+    )
+    dominance = blocked_domain_dominance(summary, count=count)
+    if count <= 0 or share_pct is None or not blocked_domain_threshold_met(share_pct, dominance):
+        return None
+
+    name, redacted = domain_name(summary, "top_blocked_domain")
+    entity_label = top_entity_label(summary, count=count) if redacted else (name or "blocked_domain_1")
+    total = int_value(summary.get("blocked_queries"))
+    if total <= 0 and share_pct > 0:
+        total = int(round(count / (share_pct / 100.0)))
+
+    observation = (
+        "One redacted blocked DNS domain accounted for an unusually large share of blocked DNS activity."
+        if redacted
+        else "This domain accounted for an unusually large share of blocked DNS activity."
+    )
+    return ConcentrationSignal(
+        signal_kind="dns_blocked_domain",
+        entity_label=entity_label,
+        entity_type="DNS domain",
+        name=name,
+        name_redacted=redacted,
+        count=count,
+        total=total,
+        share_pct=share_pct,
+        dominance_ratio=dominance,
+        share_label="Share of blocked DNS activity",
+        observation=observation,
+        review=(
+            "Review recommended locally if this concentration is unexpected."
+            if redacted
+            else "Review recommended to determine whether this concentration is intentional."
+        ),
+        persistence="Not evaluated; only the current safe DNS summary is available.",
+        confidence=concentration_confidence(share_pct, dominance, persistence_available=False),
+    )
+
+
 def top_entity_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
     top_entities = summary.get("top_entities")
+    entity_type = "DNS entity"
+    if not isinstance(top_entities, list) or not top_entities:
+        top_entities = summary.get("top_domains")
+        entity_type = "DNS domain"
     if not isinstance(top_entities, list) or not top_entities:
         return None
 
@@ -630,16 +802,41 @@ def top_entity_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
     return ConcentrationSignal(
         signal_kind="dns_entity",
         entity_label=label,
-        entity_type="DNS entity",
+        entity_type=entity_type,
         name=name,
         name_redacted=redacted,
         count=count,
         total=total,
         share_pct=share_pct,
         dominance_ratio=dominance,
+        share_label="Share of total DNS activity",
+        observation=(
+            "One redacted DNS entity accounted for an unusually large share of DNS activity."
+            if redacted
+            else "This DNS entity accounted for an unusually large share of DNS activity."
+        ),
+        review=(
+            "Review recommended locally if this concentration is unexpected."
+            if redacted
+            else "Review recommended to determine whether this concentration is intentional."
+        ),
         persistence="Not evaluated; only the current safe DNS summary is available.",
         confidence=concentration_confidence(share_pct, dominance, persistence_available=False),
     )
+
+
+EXPECTED_BLOCK_REASON_NAMES = {
+    "oisd",
+    "easylist",
+    "hagezi",
+    "ha gezi",
+    "adguard",
+}
+
+
+def obvious_expected_block_reason(name: str) -> bool:
+    normalized = name.lower()
+    return any(marker in normalized for marker in EXPECTED_BLOCK_REASON_NAMES)
 
 
 def top_reason_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
@@ -672,6 +869,8 @@ def top_reason_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
     dominance = (top_count / next_count) if next_count > 0 else None
     if share < 50 or (dominance is not None and dominance < 2):
         return None
+    if obvious_expected_block_reason(top_name) and share < 85 and (dominance is None or dominance < 5):
+        return None
 
     return ConcentrationSignal(
         signal_kind="blocked_reason",
@@ -683,6 +882,9 @@ def top_reason_signal(summary: dict[str, Any]) -> ConcentrationSignal | None:
         total=total,
         share_pct=share,
         dominance_ratio=dominance,
+        share_label="Share of available blocked-reason activity",
+        observation=f"{top_name} represented {pct(share)} of available blocked-reason activity.",
+        review="Review recommended only if this concentration is unexpected.",
         persistence="Not evaluated; only the current safe DNS summary is available.",
         confidence=concentration_confidence(share, dominance, persistence_available=False),
     )
@@ -696,11 +898,29 @@ def analyze_concentration(dns: dict[str, Any] | None) -> dict[str, Any]:
         }
 
     summary = dns["summary"]
-    if not isinstance(summary.get("top_entities"), list) and not isinstance(summary.get("top_reasons"), list):
+    has_concentration_shape = any(
+        [
+            summary.get("top_queried_domain_count") is not None,
+            summary.get("top_resolved_domain_count") is not None,
+            summary.get("top_blocked_domain_count") is not None,
+            isinstance(summary.get("top_entities"), list),
+            isinstance(summary.get("top_domains"), list),
+            isinstance(summary.get("top_reasons"), list),
+        ]
+    )
+    if not has_concentration_shape:
         return {
             "signals": [],
             "message": "No concentration signals were evaluated because the available exported summaries do not include safe top-N entity data.",
         }
+
+    domain = total_domain_signal(summary)
+    if domain is not None:
+        return {"signals": [domain], "message": None}
+
+    blocked_domain = blocked_domain_signal(summary)
+    if blocked_domain is not None:
+        return {"signals": [blocked_domain], "message": None}
 
     entity = top_entity_signal(summary)
     if entity is not None:
@@ -800,38 +1020,27 @@ def render_concentration_section(concentration: dict[str, Any]) -> list[str]:
 
     for signal in signals:
         ratio = "n/a" if signal.dominance_ratio is None else f"{signal.dominance_ratio:.1f}x"
-        if signal.signal_kind == "dns_entity":
-            display_name = signal.name or signal.entity_label
+        if signal.signal_kind.startswith("dns_"):
+            display_name = entity_display_label(signal.name, signal.name_redacted, signal.entity_label)
             name_line = (
                 "Name: redacted by Prime Observer privacy settings"
                 if signal.name_redacted
                 else f"Name: {display_name}"
             )
-            context_line = (
-                "The entity name is redacted by Prime Observer's privacy-safe export."
-                if signal.name_redacted
-                else "This may be intentional, but it is concentrated compared with other exported DNS entities."
-            )
-            review_line = (
-                "Review is only useful if you intentionally reveal or inspect the entity locally."
-                if signal.name_redacted
-                else "Review recommended only if this concentration is unexpected."
-            )
             lines.extend(
                 [
-                    f"### Concentration: DNS entity {display_name}",
+                    f"### Concentration: {display_name}",
                     "",
                     f"- Entity label: {signal.entity_label}",
                     f"- Entity type: {signal.entity_type}",
                     f"- {name_line}",
                     f"- Count: {signal.count}",
-                    f"- Share of total DNS activity: {pct(signal.share_pct)}",
+                    f"- {signal.share_label}: {pct(signal.share_pct)}",
                     f"- Dominance ratio vs next peer: {ratio}",
                     f"- Persistence: {signal.persistence}",
                     f"- Confidence: {signal.confidence}",
-                    f"- A single DNS entity represented {pct(signal.share_pct)} of total DNS activity.",
-                    f"- {context_line}",
-                    f"- {review_line}",
+                    f"- {signal.observation}",
+                    f"- {signal.review}",
                     "",
                 ]
             )
@@ -846,9 +1055,8 @@ def render_concentration_section(concentration: dict[str, Any]) -> list[str]:
                     f"- Dominance ratio vs next peer: {ratio}",
                     f"- Persistence: {signal.persistence}",
                     f"- Confidence: {signal.confidence}",
-                    f"- {signal.entity_label} represented {pct(signal.share_pct)} of available blocked-reason activity.",
-                    "- This may be intentional, but it is highly concentrated compared with other exported reasons.",
-                    "- Review recommended only if this concentration is unexpected.",
+                    f"- {signal.observation}",
+                    f"- {signal.review}",
                     "",
                 ]
             )

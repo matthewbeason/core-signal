@@ -559,6 +559,40 @@ class CoreSignalTests(unittest.TestCase):
         self.assertIn("History files read: 1 of 4 available bakeoff file(s)", markdown)
         self.assertIn("Date range analyzed: 2026-05-25 09:00 UTC to 2026-05-25 09:00 UTC", markdown)
 
+    def test_visible_top_queried_domain_concentration_is_prioritized(self) -> None:
+        result = analyze_concentration(
+            {
+                "status": "ok",
+                "summary": {
+                    "total_queries": 1000,
+                    "top_queried_domain": "urldb.meetcircle-netgear.co",
+                    "top_queried_domain_count": 460,
+                    "top_queried_domain_share": 0.46,
+                    "top_queried_domain_redacted": False,
+                    "top_entities": [
+                        {
+                            "label": "entity_1",
+                            "name": "urldb.meetcircle-netgear.co",
+                            "count": 460,
+                            "share_of_total": 0.46,
+                            "dominance_ratio": 8.2,
+                            "name_redacted": False,
+                        }
+                    ],
+                    "top_reasons": [{"name": "Native Tracking", "queries": 90}],
+                },
+            }
+        )
+        signal = result["signals"][0]
+        self.assertEqual(signal.signal_kind, "dns_queried_domain")
+        self.assertEqual(signal.entity_label, "urldb.meetcircle-netgear.co")
+        self.assertEqual(signal.entity_type, "DNS domain")
+        self.assertEqual(signal.name, "urldb.meetcircle-netgear.co")
+        self.assertFalse(signal.name_redacted)
+        self.assertEqual(signal.count, 460)
+        self.assertAlmostEqual(signal.share_pct, 46.0)
+        self.assertAlmostEqual(signal.dominance_ratio, 8.2)
+
     def test_concentration_signal_detected_when_one_entity_dominates(self) -> None:
         result = analyze_concentration(
             {
@@ -590,7 +624,7 @@ class CoreSignalTests(unittest.TestCase):
         self.assertAlmostEqual(signal.dominance_ratio, 6.0)
         self.assertEqual(signal.confidence, "Medium")
 
-    def test_no_concentration_signal_when_distribution_is_balanced(self) -> None:
+    def test_low_share_low_dominance_entities_are_suppressed(self) -> None:
         result = analyze_concentration(
             {
                 "status": "ok",
@@ -612,6 +646,32 @@ class CoreSignalTests(unittest.TestCase):
         )
         self.assertEqual(result["signals"], [])
         self.assertIn("No concentration signal met", result["message"])
+
+    def test_top_blocked_domain_concentration_uses_blocked_activity_share(self) -> None:
+        result = analyze_concentration(
+            {
+                "status": "ok",
+                "summary": {
+                    "total_queries": 1000,
+                    "blocked_queries": 100,
+                    "top_queried_domain": "ordinary.example",
+                    "top_queried_domain_count": 90,
+                    "top_queried_domain_share": 0.09,
+                    "top_queried_domain_redacted": False,
+                    "top_blocked_domain": "blocked.example",
+                    "top_blocked_domain_count": 40,
+                    "top_blocked_domain_share_of_blocked": 0.40,
+                    "top_blocked_domain_redacted": False,
+                    "top_reasons": [{"name": "Native Tracking", "queries": 80}],
+                },
+            }
+        )
+        signal = result["signals"][0]
+        self.assertEqual(signal.signal_kind, "dns_blocked_domain")
+        self.assertEqual(signal.entity_label, "blocked.example")
+        self.assertEqual(signal.entity_type, "DNS domain")
+        self.assertEqual(signal.share_label, "Share of blocked DNS activity")
+        self.assertAlmostEqual(signal.share_pct, 40.0)
 
     def test_redacted_top_entity_is_rendered_safely(self) -> None:
         markdown = render_pattern_report(
@@ -639,9 +699,8 @@ class CoreSignalTests(unittest.TestCase):
         self.assertIn("Entity label: entity_1", concentration)
         self.assertIn("Entity type: DNS entity", concentration)
         self.assertIn("Name: redacted by Prime Observer privacy settings", concentration)
-        self.assertIn("A single DNS entity represented 25.0% of total DNS activity.", concentration)
-        self.assertIn("The entity name is redacted by Prime Observer's privacy-safe export.", concentration)
-        self.assertIn("Review is only useful if you intentionally reveal or inspect the entity locally.", concentration)
+        self.assertIn("One redacted DNS entity accounted for an unusually large share of DNS activity.", concentration)
+        self.assertIn("Review recommended locally if this concentration is unexpected.", concentration)
         self.assertNotIn("domain represented", concentration)
 
     def test_entity_concentration_is_prioritized_over_top_reasons(self) -> None:
@@ -671,7 +730,48 @@ class CoreSignalTests(unittest.TestCase):
         self.assertEqual(result["signals"][0].signal_kind, "dns_entity")
         self.assertEqual(result["signals"][0].entity_label, "entity_1")
 
-    def test_top_reasons_remains_fallback_when_top_entities_absent(self) -> None:
+    def test_top_reasons_remains_fallback_when_domain_and_entity_signals_absent(self) -> None:
+        result = analyze_concentration(
+            {
+                "status": "ok",
+                "summary": {
+                    "blocked_queries": 100,
+                    "top_reasons": [
+                        {"name": "Native Tracking", "queries": 72},
+                        {"name": "DNS Rebinding", "queries": 18},
+                        {"name": "Other", "queries": 10},
+                    ],
+                },
+            }
+        )
+        signal = result["signals"][0]
+        self.assertEqual(signal.signal_kind, "blocked_reason")
+        self.assertEqual(signal.entity_label, "Native Tracking")
+        self.assertEqual(signal.entity_type, "Blocked DNS reason")
+        self.assertEqual(signal.count, 72)
+        self.assertAlmostEqual(signal.share_pct, 72.0)
+        self.assertAlmostEqual(signal.dominance_ratio, 4.0)
+
+    def test_top_reasons_fallback_does_not_override_blocked_domain_signal(self) -> None:
+        result = analyze_concentration(
+            {
+                "status": "ok",
+                "summary": {
+                    "blocked_queries": 100,
+                    "top_blocked_domain": "blocked.example",
+                    "top_blocked_domain_count": 36,
+                    "top_blocked_domain_share_of_blocked": 0.36,
+                    "top_blocked_domain_redacted": False,
+                    "top_reasons": [
+                        {"name": "Native Tracking", "queries": 90},
+                        {"name": "DNS Rebinding", "queries": 10},
+                    ],
+                },
+            }
+        )
+        self.assertEqual(result["signals"][0].signal_kind, "dns_blocked_domain")
+
+    def test_expected_blocklist_reason_is_suppressed_unless_clearly_useful(self) -> None:
         result = analyze_concentration(
             {
                 "status": "ok",
@@ -685,13 +785,7 @@ class CoreSignalTests(unittest.TestCase):
                 },
             }
         )
-        signal = result["signals"][0]
-        self.assertEqual(signal.signal_kind, "blocked_reason")
-        self.assertEqual(signal.entity_label, "OISD")
-        self.assertEqual(signal.entity_type, "Blocked DNS reason")
-        self.assertEqual(signal.count, 72)
-        self.assertAlmostEqual(signal.share_pct, 72.0)
-        self.assertAlmostEqual(signal.dominance_ratio, 4.0)
+        self.assertEqual(result["signals"], [])
 
     def test_concentration_insufficient_data_message_when_no_safe_top_n_exists(self) -> None:
         markdown = render_pattern_report(
@@ -715,17 +809,17 @@ class CoreSignalTests(unittest.TestCase):
                     "summary": {
                         "blocked_queries": 100,
                         "top_reasons": [
-                            {"name": "OISD", "queries": 72},
-                            {"name": "Native Tracking", "queries": 18},
+                            {"name": "Native Tracking", "queries": 72},
+                            {"name": "DNS Rebinding", "queries": 18},
                         ],
                     },
                 },
             )
         )
         concentration = section(markdown, "## Concentration Signals")
-        self.assertIn("### Concentration: OISD block reason", concentration)
+        self.assertIn("### Concentration: Native Tracking block reason", concentration)
         self.assertIn("Review recommended only if this concentration is unexpected.", concentration)
-        for term in ("Problem", "Failure", "Alert", "Threat"):
+        for term in ("Problem", "Failure", "Alert", "Threat", "suspicious", "malicious"):
             self.assertNotIn(term, concentration)
 
 

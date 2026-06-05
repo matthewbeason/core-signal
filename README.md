@@ -307,9 +307,11 @@ Core Signal falls back to its deterministic local attribution logic.
 
 Weekly pattern reports can include DNS Concentration Signals when the optional
 `viz/nextdns_summary.json` export includes safe top-N summary data. Core Signal
-prefers privacy-safe `top_entities` concentration fields and falls back to
-blocked DNS reasons when entity concentration does not meet the deterministic
-threshold.
+prefers total-activity domain/entity concentration from `top_queried_domain`,
+`top_resolved_domain`, and privacy-safe `top_entities` fields, then considers
+blocked-domain concentration across blocked DNS activity. Blocked DNS reasons
+are used only as a fallback when no more specific domain/entity concentration
+signal is available.
 
 Core Signal respects Prime Observer's privacy boundary. It does not read raw DNS
 logs, call the NextDNS API, expose client IPs or device names, or reveal full
