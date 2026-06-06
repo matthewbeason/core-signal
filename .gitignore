@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 logs/
+data/dns_observations.jsonl
 reports/*.md
 reports/patterns/*.md
 !reports/.gitkeep

@@ -111,7 +111,8 @@ Generate the weekly pattern report from the default Prime Observer history:
 PYTHONPATH=src python3 -m core_signal.cli \
   --pattern-report \
   --history-dir /Users/mbeason/prime-observer/data \
-  --history-days 30
+  --history-days 30 \
+  --dns-history data/dns_observations.jsonl
 ```
 
 ## Usage
@@ -303,15 +304,21 @@ prefers per-incident attribution for sustained slowdowns, then window-level
 attribution, then current attribution. If the export is missing or unusable,
 Core Signal falls back to its deterministic local attribution logic.
 
-## DNS Concentration Signals
+## DNS Interpretation
 
-Weekly pattern reports can include DNS Concentration Signals when the optional
+Weekly pattern reports include a DNS Interpretation section when the optional
 `viz/nextdns_summary.json` export includes safe top-N summary data. Core Signal
-prefers total-activity domain/entity concentration from `top_queried_domain`,
-`top_resolved_domain`, and privacy-safe `top_entities` fields, then considers
-blocked-domain concentration across blocked DNS activity. Blocked DNS reasons
-are used only as a fallback when no more specific domain/entity concentration
-signal is available.
+appends privacy-safe DNS observations to ignored local history at
+`data/dns_observations.jsonl`, deduplicated by source `generated_at` and
+`window`, then compares the current DNS summary against that local history.
+
+DNS interpretation prefers total-activity domain/entity concentration from
+`top_queried_domain`, `top_resolved_domain`, and privacy-safe `top_entities`
+fields, then considers blocked-domain concentration across blocked DNS activity.
+Blocked DNS reasons are used only as a fallback when no more specific
+domain/entity concentration signal is available. If local DNS history is
+insufficient, Core Signal says so and avoids treating one summary as a stable
+pattern.
 
 Core Signal respects Prime Observer's privacy boundary. It does not read raw DNS
 logs, call the NextDNS API, expose client IPs or device names, or reveal full

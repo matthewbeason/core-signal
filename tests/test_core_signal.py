@@ -7,6 +7,12 @@ from pathlib import Path
 
 from core_signal.analyze import analyze
 from core_signal.brief import render_brief, report_date, write_reports
+from core_signal.dns_interpretation import (
+    analyze_dns_interpretation,
+    normalize_dns_summary,
+    observation_history_event,
+    read_dns_history,
+)
 from core_signal.ingest import (
     CsvSchemaError,
     Observation,
@@ -695,12 +701,14 @@ class CoreSignalTests(unittest.TestCase):
                 },
             )
         )
-        concentration = section(markdown, "## Concentration Signals")
-        self.assertIn("Entity label: entity_1", concentration)
-        self.assertIn("Entity type: DNS entity", concentration)
-        self.assertIn("Name: redacted by Prime Observer privacy settings", concentration)
-        self.assertIn("One redacted DNS entity accounted for an unusually large share of DNS activity.", concentration)
-        self.assertIn("Review recommended locally if this concentration is unexpected.", concentration)
+        concentration = section(markdown, "## DNS Interpretation")
+        self.assertIn("### Total DNS concentration: entity_1", concentration)
+        self.assertIn("Finding type: total_activity_concentration", concentration)
+        self.assertIn("One redacted DNS entity accounted for a large share of total DNS activity.", concentration)
+        self.assertIn(
+            "Review locally if this concentration is unexpected; Prime Observer redacted the name by privacy settings.",
+            concentration,
+        )
         self.assertNotIn("domain represented", concentration)
 
     def test_entity_concentration_is_prioritized_over_top_reasons(self) -> None:
@@ -794,13 +802,13 @@ class CoreSignalTests(unittest.TestCase):
                 dns={"status": "ok", "summary": {"blocked_queries": 100}},
             )
         )
-        concentration = section(markdown, "## Concentration Signals")
+        concentration = section(markdown, "## DNS Interpretation")
         self.assertIn(
-            "No concentration signals were evaluated because the available exported summaries do not include safe top-N entity data.",
+            "No DNS-specific action is suggested from this weekly report.",
             concentration,
         )
 
-    def test_pattern_report_includes_concentration_section_and_avoids_alarm_language(self) -> None:
+    def test_pattern_report_includes_dns_interpretation_section_and_avoids_alarm_language(self) -> None:
         markdown = render_pattern_report(
             analyze_patterns(
                 [pattern_obs(25, 9, 0, "1.1.1.1", 150, 55)],
@@ -816,11 +824,91 @@ class CoreSignalTests(unittest.TestCase):
                 },
             )
         )
-        concentration = section(markdown, "## Concentration Signals")
-        self.assertIn("### Concentration: Native Tracking block reason", concentration)
-        self.assertIn("Review recommended only if this concentration is unexpected.", concentration)
+        concentration = section(markdown, "## DNS Interpretation")
+        self.assertIn("### Blocked DNS reason concentration: Native Tracking", concentration)
+        self.assertIn("Review locally only if this concentration is unexpected.", concentration)
         for term in ("Problem", "Failure", "Alert", "Threat", "suspicious", "malicious"):
             self.assertNotIn(term, concentration)
+
+    def test_dns_history_appends_and_deduplicates_by_generated_at_and_window(self) -> None:
+        dns = {
+            "status": "ok",
+            "generated_at": "2026-06-06T03:00:00Z",
+            "window": "-24h",
+            "summary": {
+                "total_queries": 1000,
+                "blocked_queries": 100,
+                "dns_block_rate": 0.10,
+                "top_queried_domain": "example.test",
+                "top_queried_domain_count": 300,
+                "top_queried_domain_share": 0.30,
+                "top_queried_domain_redacted": False,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dns_observations.jsonl"
+            current, prior, appended = observation_history_event(dns, path)
+            self.assertIsNotNone(current)
+            self.assertEqual(prior, [])
+            self.assertTrue(appended)
+            self.assertEqual(len(read_dns_history(path)), 1)
+
+            _, prior, appended = observation_history_event(dns, path)
+            self.assertEqual(len(prior), 1)
+            self.assertFalse(appended)
+            self.assertEqual(len(read_dns_history(path)), 1)
+
+    def test_dns_interpretation_compares_current_against_history(self) -> None:
+        current = normalize_dns_summary(
+            {
+                "status": "ok",
+                "generated_at": "2026-06-06T03:00:00Z",
+                "window": "-24h",
+                "summary": {
+                    "total_queries": 1000,
+                    "blocked_queries": 100,
+                    "top_queried_domain": "example.test",
+                    "top_queried_domain_count": 300,
+                    "top_queried_domain_share": 0.30,
+                    "top_queried_domain_redacted": False,
+                    "top_entities": [
+                        {
+                            "label": "entity_1",
+                            "name": "example.test",
+                            "count": 300,
+                            "share_of_total": 0.30,
+                            "dominance_ratio": 6.0,
+                            "name_redacted": False,
+                        }
+                    ],
+                },
+            }
+        )
+        prior = [
+            normalize_dns_summary(
+                {
+                    "status": "ok",
+                    "generated_at": f"2026-06-0{day}T03:00:00Z",
+                    "window": "-24h",
+                    "summary": {
+                        "total_queries": 1000,
+                        "blocked_queries": 100,
+                        "top_queried_domain": "example.test",
+                        "top_queried_domain_count": 240,
+                        "top_queried_domain_share": 0.24,
+                        "top_queried_domain_redacted": False,
+                    },
+                }
+            )
+            for day in range(3, 6)
+        ]
+        interpretation = analyze_dns_interpretation(current, [item for item in prior if item is not None])
+        finding = interpretation["findings"][1]
+        self.assertEqual(finding.status, "recurring")
+        self.assertEqual(finding.confidence, "Medium")
+        self.assertEqual(finding.finding_type, "total_activity_concentration")
+        self.assertTrue(any("Same label appeared in 3 prior observation" in item for item in finding.evidence))
+        self.assertTrue(any("Median prior share for this label: 24.0%" in item for item in finding.evidence))
 
 
 if __name__ == "__main__":

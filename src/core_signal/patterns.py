@@ -8,6 +8,7 @@ from typing import Any
 
 from . import policy
 from .analyze import SeriesPoint, classify_buckets, collapse_series, quantile
+from .dns_interpretation import analyze_dns_interpretation, normalize_dns_summary, render_dns_interpretation_section
 from .ingest import Observation
 
 
@@ -940,6 +941,7 @@ def analyze_patterns(
     observations: list[Observation],
     history: dict[str, Any] | None = None,
     dns: dict[str, Any] | None = None,
+    dns_interpretation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     lan, wan = collapse_series(observations)
     findings: list[PatternFinding] = []
@@ -990,6 +992,9 @@ def analyze_patterns(
         "lan_summary": point_stats(lan),
         "findings": findings,
         "concentration": analyze_concentration(dns),
+        "dns_interpretation": dns_interpretation
+        if dns_interpretation is not None
+        else analyze_dns_interpretation(normalize_dns_summary(dns), []),
         "support_notes": support_notes,
         "history": history,
     }
@@ -1115,7 +1120,7 @@ def render_pattern_report(analysis: dict[str, Any]) -> str:
         lines.extend(f"  - {item}" for item in finding.possible_explanations)
         lines.append("")
 
-    lines.extend(render_concentration_section(analysis.get("concentration") or {}))
+    lines.extend(render_dns_interpretation_section(analysis.get("dns_interpretation") or {}))
 
     lines.extend(
         [

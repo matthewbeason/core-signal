@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .analyze import analyze
 from .brief import render_brief, report_date, write_reports
+from .dns_interpretation import DEFAULT_DNS_HISTORY, analyze_dns_interpretation, observation_history_event
 from .ingest import (
     DEFAULT_ATTRIBUTION,
     DEFAULT_CSV,
@@ -56,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("reports/patterns"),
         help="Pattern report output directory.",
     )
+    parser.add_argument(
+        "--dns-history",
+        type=Path,
+        default=DEFAULT_DNS_HISTORY,
+        help="Local privacy-safe DNS observation history for weekly pattern reports.",
+    )
     parser.add_argument("--window-hours", type=int, default=24, help="Observation window in hours.")
     parser.add_argument(
         "--pattern-report",
@@ -88,6 +95,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: Could not read Prime Observer history exports: {exc}")
             return 2
 
+        dns = read_dns_summary(dns_path)
+        current_dns_observation, prior_dns_observations, dns_appended = observation_history_event(
+            dns,
+            args.dns_history,
+        )
+        dns_interpretation = analyze_dns_interpretation(
+            current_dns_observation,
+            prior_dns_observations,
+            appended=dns_appended,
+        )
+
         analysis = analyze_patterns(
             history.ingest.observations,
             history={
@@ -100,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
                 "warnings": history.ingest.warnings,
                 "ignored_hosts": history.ingest.ignored_hosts,
             },
-            dns=read_dns_summary(dns_path),
+            dns=dns,
+            dns_interpretation=dns_interpretation,
         )
         markdown = render_pattern_report(analysis)
         dated, latest = write_pattern_reports(markdown, args.patterns_dir, pattern_report_date(analysis))
