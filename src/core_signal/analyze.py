@@ -474,6 +474,130 @@ def evidence_window(window_start: dt.datetime | None, window_end: dt.datetime | 
     }
 
 
+def source_label(source: str) -> str:
+    if source.startswith("prime_observer"):
+        return "Prime Observer investigation reference"
+    if source == "core_signal_fallback":
+        return "network attribution observation"
+    return source or "telemetry observation"
+
+
+def confidence_reason(confidence: str, attribution_result: dict[str, Any], status: str, kind: str) -> str:
+    source = attribution_result.get("source", "core_signal_fallback")
+    why = str(attribution_result.get("why") or "").strip()
+    if source == "prime_observer_current" and status == "Attention":
+        return (
+            "Medium confidence because Core Signal detected an actionable historical event, "
+            "but the available Prime Observer attribution was current-state rather than event-specific."
+        )
+    if confidence == "High":
+        return f"High confidence because {why}" if why else "High confidence because multiple relevant observations agreed."
+    if confidence == "Medium":
+        return f"Medium confidence because {why}" if why else "Medium confidence because the event was meaningful but the source attribution was limited."
+    if confidence == "Low":
+        return f"Low confidence because {why}" if why else "Low confidence because usable evidence was limited."
+    if kind == "baseline_slowdown":
+        return "Confidence follows the historical baseline sample count and recurrence context."
+    return "Confidence was limited because Core Signal could not find enough supporting evidence for a stronger judgment."
+
+
+def event_confidence(status: str, kind: str, attribution_result: dict[str, Any], pattern: dict[str, Any]) -> str:
+    if attribution_result.get("source") == "prime_observer_current" and status == "Attention":
+        return "Medium"
+    if kind == "baseline_slowdown":
+        return normalize_confidence(pattern.get("confidence"))
+    return normalize_confidence(attribution_result.get("confidence") or pattern.get("confidence"))
+
+
+def fact_reference_url(reference: dict[str, Any] | None) -> str | None:
+    if not reference:
+        return None
+    return reference.get("url") or reference.get("path")
+
+
+def build_supporting_facts(
+    kind: str,
+    summary: str,
+    affected_start: dt.datetime | None,
+    affected_end: dt.datetime | None,
+    wan_health: dict[str, Any],
+    raw_spikes: list[SeriesPoint],
+    report_attribution_result: dict[str, Any],
+    reference: dict[str, Any] | None,
+    pattern: dict[str, Any],
+) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    window = evidence_window(affected_start, affected_end)
+    if window is not None:
+        facts.append(
+            {
+                "id": "fact-telemetry-window",
+                "kind": "telemetry_window",
+                "summary": summary,
+                "source": "telemetry observation",
+                "reference": fact_reference_url(reference),
+                "window": window,
+            }
+        )
+
+    attribution_why = str(report_attribution_result.get("why") or "").strip()
+    if attribution_why:
+        facts.append(
+            {
+                "id": "fact-attribution",
+                "kind": "network_attribution",
+                "summary": attribution_why,
+                "source": source_label(str(report_attribution_result.get("source") or "")),
+                "reference": fact_reference_url(reference),
+                "observed_at": report_attribution_result.get("generated_at"),
+                "window": {
+                    "window_start": report_attribution_result.get("start") or affected_start,
+                    "window_end": report_attribution_result.get("end") or affected_end,
+                },
+            }
+        )
+
+    if raw_spikes and kind in {"turbulence", "isolated_instability"}:
+        facts.append(
+            {
+                "id": "fact-raw-instability",
+                "kind": "telemetry_observation",
+                "summary": f"{len(raw_spikes)} raw WAN threshold crossing(s) were present without enough persistence for a stronger event.",
+                "source": "telemetry observation",
+                "reference": fact_reference_url(reference),
+                "window": window,
+            }
+        )
+
+    if kind == "baseline_slowdown":
+        facts.append(
+            {
+                "id": "fact-historical-baseline",
+                "kind": "historical_baseline",
+                "summary": (
+                    f"{pattern.get('label')} with {pattern.get('confidence')} baseline confidence "
+                    f"from {pattern.get('sample_count')} comparable sample(s)."
+                ),
+                "source": "telemetry observation",
+                "reference": None,
+                "window": window,
+            }
+        )
+
+    if not facts and wan_health.get("samples", 0) == 0:
+        facts.append(
+            {
+                "id": "fact-missing-telemetry",
+                "kind": "telemetry_observation",
+                "summary": "No usable internet telemetry was available for the latest export window.",
+                "source": "telemetry observation",
+                "reference": None,
+                "window": window,
+            }
+        )
+    return facts
+
+
 def event_status_from_inputs(
     wan_health: dict[str, Any],
     sustained_buckets: list[dict[str, Any]],
@@ -584,21 +708,44 @@ def build_event_metadata(
     location = event_issue_location(status, report_attribution_result)
     reference = prime_observer_reference(affected_start, affected_end, report_attribution_result)
     reference_id = reference.get("id") or reference.get("url") if reference else None
+    confidence = event_confidence(status, kind, report_attribution_result, pattern)
+    supporting_facts = build_supporting_facts(
+        kind,
+        summary,
+        affected_start,
+        affected_end,
+        wan_health,
+        raw_spikes,
+        report_attribution_result,
+        reference,
+        pattern,
+    )
+    event_id = stable_event_id(kind, affected_start, affected_end, report_attribution_result.get("source", ""), reference_id)
     event = {
-        "id": stable_event_id(kind, affected_start, affected_end, report_attribution_result.get("source", ""), reference_id),
+        "id": event_id,
         "kind": kind,
         "status": status,
         "severity": severity_for_status(status),
-        "confidence": normalize_confidence(report_attribution_result.get("confidence") or pattern.get("confidence")),
+        "confidence": confidence,
+        "confidence_reason": confidence_reason(confidence, report_attribution_result, status, kind),
         "window_start": affected_start,
         "window_end": affected_end,
         "summary": summary,
         "why": why,
+        "supporting_facts": supporting_facts,
         "recommended_action": event_recommended_action(status, location),
+        "recommendation_trace": {
+            "event_id": event_id,
+            "supporting_fact_ids": [fact["id"] for fact in supporting_facts],
+            "confidence": confidence,
+            "confidence_reason": confidence_reason(confidence, report_attribution_result, status, kind),
+        },
         "issue_location": location,
+        "interpretation_source": "core_signal",
         "attribution_source": report_attribution_result.get("source", "core_signal_fallback"),
         "prime_observer_reference": reference,
         "evidence_window": evidence_window(affected_start, affected_end),
+        "related_events": [],
     }
     return [event]
 

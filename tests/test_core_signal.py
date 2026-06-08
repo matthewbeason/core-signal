@@ -286,6 +286,21 @@ class CoreSignalTests(unittest.TestCase):
         self.assertEqual(event["evidence_window"]["source"], "prime_observer")
         self.assertIn("Sustained slowdown", event["why"])
         self.assertIn("Check provider status", event["recommended_action"])
+        self.assertEqual(event["interpretation_source"], "core_signal")
+        self.assertEqual(event["related_events"], [])
+        self.assertIn("confidence_reason", event)
+        self.assertIn("supporting_facts", event)
+        self.assertGreaterEqual(len(event["supporting_facts"]), 2)
+        self.assertEqual(event["supporting_facts"][0]["kind"], "telemetry_window")
+        self.assertEqual(event["supporting_facts"][0]["source"], "telemetry observation")
+        self.assertEqual(event["supporting_facts"][1]["kind"], "network_attribution")
+        self.assertEqual(event["supporting_facts"][1]["source"], "Prime Observer investigation reference")
+        self.assertEqual(event["recommendation_trace"]["event_id"], event["id"])
+        self.assertEqual(event["recommendation_trace"]["confidence"], event["confidence"])
+        self.assertEqual(
+            set(event["recommendation_trace"]["supporting_fact_ids"]),
+            {fact["id"] for fact in event["supporting_facts"]},
+        )
         markdown = render_brief(result)
         self.assertIn("Issue Location: Likely upstream/ISP issue", markdown)
         self.assertIn("Prime Observer investigation: viz/investigate.html?", markdown)
@@ -414,6 +429,77 @@ class CoreSignalTests(unittest.TestCase):
         )
         self.assertEqual(result["report_attribution"]["source"], "prime_observer_current")
         self.assertEqual(result["events"][0]["attribution_source"], "prime_observer_current")
+
+    def test_significant_events_have_structured_explanation_metadata(self) -> None:
+        result = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+        )
+        event = result["events"][0]
+        for field in (
+            "summary",
+            "why",
+            "supporting_facts",
+            "recommended_action",
+            "confidence",
+            "confidence_reason",
+            "interpretation_source",
+            "related_events",
+        ):
+            self.assertIn(field, event)
+        self.assertEqual(event["interpretation_source"], "core_signal")
+        self.assertTrue(event["summary"])
+        self.assertTrue(event["why"])
+        self.assertTrue(event["recommended_action"])
+        self.assertTrue(event["confidence_reason"])
+        self.assertIsInstance(event["supporting_facts"], list)
+        self.assertIsInstance(event["related_events"], list)
+
+    def test_recommendations_are_traceable_to_event_facts_and_confidence(self) -> None:
+        result = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+        )
+        event = result["events"][0]
+        trace = event["recommendation_trace"]
+        self.assertEqual(trace["event_id"], event["id"])
+        self.assertEqual(trace["confidence"], event["confidence"])
+        self.assertEqual(trace["confidence_reason"], event["confidence_reason"])
+        self.assertTrue(trace["supporting_fact_ids"])
+        self.assertEqual(set(trace["supporting_fact_ids"]), {fact["id"] for fact in event["supporting_facts"]})
+
+    def test_current_state_attribution_does_not_overstate_historical_event_confidence(self) -> None:
+        exported = {
+            "current_attribution": {
+                "status": "no_issue_detected",
+                "label": "No network issue detected",
+                "confidence": "high",
+                "evidence": ["LAN and WAN both look stable now."],
+            }
+        }
+        result = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+            exported,
+        )
+        event = result["events"][0]
+        self.assertEqual(event["confidence"], "Medium")
+        self.assertIn("current-state rather than event-specific", event["confidence_reason"])
 
     def test_technical_evidence_stays_compact_by_default(self) -> None:
         result = analyze([obs(0, "1.1.1.1", 20), obs(0, "192.168.1.1", 10)], None)

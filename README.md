@@ -309,17 +309,59 @@ Core Signal falls back to its deterministic local attribution logic.
 Morning-brief analysis includes an additive `events` list for downstream
 consumers. Each Core Signal event is interpretation and navigation metadata:
 deterministic `core-signal-...` ID, event kind, status, severity, confidence,
-affected window, summary, why, recommended action, issue location, attribution
-source, and a compact Prime Observer reference when an evidence window is
-navigable.
+confidence rationale, affected window, summary, why, recommended action,
+recommendation trace, issue location, attribution source, supporting facts, and
+a compact Prime Observer reference when an evidence window is navigable.
 
-Prime Observer v0.5.0 owns the historical investigation workflow:
-`bin/build_investigation.py` writes `viz/investigation.json`, and
-`viz/investigate.html` renders the local evidence view. Core Signal does not
-copy timelines, samples, DNS details, or investigation presentation. It only
-points to `viz/investigate.html?start=...&end=...` and includes matching
-`--start`/`--end` command arguments so Olivaw or another local consumer can
-navigate to or generate the Prime Observer evidence view.
+Significant events normalize the following explanation fields:
+
+- `summary`: a brief interpretation of what Core Signal found.
+- `why`: why the event is meaningful to the morning-brief decision.
+- `supporting_facts`: compact factual inputs or references that support the
+  interpretation, without copying raw timelines or evidence blobs.
+- `recommended_action`: the user-facing next step, softened or omitted as
+  `None.` when evidence does not justify action.
+- `confidence`: Low, Medium, High, Unknown, or an existing compatibility value.
+- `confidence_reason`: why the confidence value is appropriate for this event.
+- `interpretation_source`: always `core_signal` for Core Signal events.
+- `related_events`: an additive list reserved for future relationship metadata.
+
+Recommendations are not emitted as orphan claims. An event recommendation is
+paired with `recommendation_trace`, which points back to the event ID, the
+supporting fact IDs, the event confidence, and the confidence rationale. If Core
+Signal has only current-state attribution for a historical event, it keeps the
+recommendation softer by lowering the interpreted event confidence rather than
+treating the current-state source as event-specific proof.
+
+Supporting facts use compact structured references:
+
+- `kind`: the kind of fact, such as `telemetry_window`,
+  `network_attribution`, `telemetry_observation`, or `historical_baseline`.
+- `summary`: a short factual summary.
+- `source`: the factual input family, such as telemetry observation, DNS
+  observation, network attribution observation, or Prime Observer investigation
+  reference.
+- `reference`: an optional local reference such as a Prime Observer
+  investigation URL.
+- `observed_at` or `window`: when the fact was observed or the bounded evidence
+  window it covers.
+
+Relationship metadata is prepared as `related_events[]` with future entries
+shaped as `event_id`, `relationship_type`, `why`, and `confidence`. Wave 2A
+emits an empty list unless a relationship is already justified by existing
+event construction; it does not add a correlation algorithm.
+
+Prime Observer owns observations, evidence, investigations, timelines, factual
+nearby-event discovery, and historical evidence references. Core Signal does
+not copy timelines, samples, DNS details, nearby-event lists, or investigation
+presentation. It only points to compact local references such as
+`viz/investigate.html?start=...&end=...` and includes matching `--start`/`--end`
+command arguments so Olivaw or another local consumer can navigate to or
+generate the Prime Observer evidence view.
+
+Olivaw owns presentation, synthesis, navigation, and attribution display. Core
+Signal does not add Olivaw formatting to event metadata; it emits structured
+interpretation fields that downstream presentation layers may choose to render.
 
 Downstream consumers should use Core Signal event IDs for stable interpreted
 events, affected windows for matching or grouping, and Prime Observer references
