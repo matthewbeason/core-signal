@@ -251,6 +251,9 @@ class CoreSignalTests(unittest.TestCase):
             },
             "incidents": [
                 {
+                    "id": "po-incident-20260530-0801",
+                    "start": "2026-05-30T08:00:00+00:00",
+                    "end": "2026-05-30T08:15:00+00:00",
                     "status": "likely_upstream",
                     "label": "Likely upstream (ISP / path)",
                     "confidence": "high",
@@ -271,9 +274,61 @@ class CoreSignalTests(unittest.TestCase):
         self.assertEqual(result["fallback_report_attribution"]["label"], "Likely upstream ISP / path")
         self.assertEqual(result["report_attribution"]["label"], "Likely upstream ISP / path")
         self.assertEqual(result["report_attribution"]["source"], "prime_observer_incident")
+        event = result["events"][0]
+        self.assertEqual(event["kind"], "sustained_slowdown")
+        self.assertEqual(event["status"], "Attention")
+        self.assertEqual(event["severity"], "attention")
+        self.assertEqual(event["confidence"], "High")
+        self.assertEqual(event["attribution_source"], "prime_observer_incident")
+        self.assertEqual(event["prime_observer_reference"]["type"], "event")
+        self.assertEqual(event["prime_observer_reference"]["id"], "po-incident-20260530-0801")
+        self.assertIn("start=2026-05-30T08%3A00%3A00%2B00%3A00", event["prime_observer_reference"]["url"])
+        self.assertEqual(event["evidence_window"]["source"], "prime_observer")
+        self.assertIn("Sustained slowdown", event["why"])
+        self.assertIn("Check provider status", event["recommended_action"])
         markdown = render_brief(result)
         self.assertIn("Issue Location: Likely upstream/ISP issue", markdown)
+        self.assertIn("Prime Observer investigation: viz/investigate.html?", markdown)
         self.assertIn("Attribution source: Prime Observer incident attribution", markdown)
+        self.assertNotIn("timeline_samples", markdown)
+        self.assertNotIn("representative telemetry", markdown)
+
+    def test_event_ids_are_deterministic_for_same_interpreted_event(self) -> None:
+        rows = [
+            obs(0, "192.168.1.1", 20),
+            obs(0, "1.1.1.1", 160),
+            obs(1, "192.168.1.1", 20),
+            obs(1, "1.1.1.1", 170),
+        ]
+        first = analyze(rows, None)
+        second = analyze(rows, None)
+        self.assertEqual(first["events"][0]["id"], second["events"][0]["id"])
+        self.assertTrue(first["events"][0]["id"].startswith("core-signal-sustained_slowdown-"))
+
+    def test_sustained_slowdown_event_uses_affected_window_metadata(self) -> None:
+        result = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+        )
+        event = result["events"][0]
+        self.assertEqual(event["window_start"], dt.datetime(2026, 5, 30, 8, 0, tzinfo=UTC))
+        self.assertEqual(event["window_end"], dt.datetime(2026, 5, 30, 8, 15, tzinfo=UTC))
+        self.assertEqual(event["prime_observer_reference"]["type"], "window")
+        self.assertEqual(event["prime_observer_reference"]["path"], "viz/investigate.html")
+        self.assertEqual(
+            event["prime_observer_reference"]["build_command_args"],
+            [
+                "--start",
+                "2026-05-30T08:00:00+00:00",
+                "--end",
+                "2026-05-30T08:15:00+00:00",
+            ],
+        )
 
     def test_prime_observer_window_attribution_is_used_when_no_incident_matches(self) -> None:
         exported = {
@@ -294,6 +349,9 @@ class CoreSignalTests(unittest.TestCase):
         self.assertEqual(result["report_attribution"]["label"], "Likely upstream ISP / path")
         self.assertEqual(result["report_attribution"]["source"], "prime_observer_window")
         self.assertIn("Attribution source: Prime Observer window attribution", render_brief(result))
+        self.assertEqual(result["events"][0]["status"], "Watch")
+        self.assertEqual(result["events"][0]["attribution_source"], "prime_observer_window")
+        self.assertEqual(result["events"][0]["prime_observer_reference"]["type"], "window")
 
     def test_prime_observer_current_attribution_is_used_when_no_window_or_incident_exists(self) -> None:
         exported = {
@@ -335,6 +393,27 @@ class CoreSignalTests(unittest.TestCase):
         self.assertEqual(result["report_attribution"]["source"], "core_signal_fallback")
         self.assertIn("Issue Location: Likely upstream/ISP issue", markdown)
         self.assertIn("Attribution source: Core Signal fallback", markdown)
+        self.assertEqual(result["events"][0]["prime_observer_reference"]["type"], "window")
+
+    def test_current_attribution_shape_remains_backward_compatible_for_events(self) -> None:
+        exported = {
+            "attribution_status": "likely_upstream",
+            "attribution_label": "Likely upstream (ISP / path)",
+            "attribution_confidence": "High",
+            "attribution_evidence": {"summary": "internet-side degradation with local gateway stable"},
+        }
+        result = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+            exported,
+        )
+        self.assertEqual(result["report_attribution"]["source"], "prime_observer_current")
+        self.assertEqual(result["events"][0]["attribution_source"], "prime_observer_current")
 
     def test_technical_evidence_stays_compact_by_default(self) -> None:
         result = analyze([obs(0, "1.1.1.1", 20), obs(0, "192.168.1.1", 10)], None)

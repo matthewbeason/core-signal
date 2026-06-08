@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 from dataclasses import dataclass
 from statistics import median
 from typing import Any
+from urllib.parse import urlencode
 
 from .ingest import Observation, parse_timestamp
 from . import policy
@@ -331,6 +333,9 @@ def normalize_prime_observer_attribution_entry(entry: dict[str, Any], source: st
         "source": source,
         "raw_status": raw_status,
         "raw_label": raw_label,
+        "id": entry.get("id") or entry.get("event_id") or entry.get("incident_id"),
+        "start": entry.get("start"),
+        "end": entry.get("end"),
         "generated_at": entry.get("generated_at"),
         "evidence": evidence,
         "metrics": metrics,
@@ -397,6 +402,207 @@ def normalize_exported_attribution(
     return normalize_prime_observer_attribution_entry(legacy, "prime_observer_current")
 
 
+def severity_for_status(status: str) -> str:
+    return {"Healthy": "none", "Watch": "watch", "Attention": "attention"}.get(status, "unknown")
+
+
+def normalize_confidence(value: Any) -> str:
+    key = str(value or "Unknown").strip().lower()
+    if key == "high":
+        return "High"
+    if key == "medium":
+        return "Medium"
+    if key == "low":
+        return "Low"
+    if key in {"none", "unknown", ""}:
+        return "Unknown"
+    return str(value).strip() or "Unknown"
+
+
+def iso_value(value: Any) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    return str(value or "")
+
+
+def stable_event_id(kind: str, window_start: Any, window_end: Any, attribution_source: str, reference_id: Any = None) -> str:
+    identity = "|".join(
+        [
+            kind,
+            iso_value(window_start),
+            iso_value(window_end),
+            attribution_source,
+            str(reference_id or ""),
+        ]
+    )
+    digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12]
+    return f"core-signal-{kind}-{digest}"
+
+
+def prime_observer_reference(
+    window_start: dt.datetime | None,
+    window_end: dt.datetime | None,
+    attribution_result: dict[str, Any],
+) -> dict[str, Any] | None:
+    if window_start is None or window_end is None:
+        return None
+    ref_start = str(attribution_result.get("start") or window_start.isoformat())
+    ref_end = str(attribution_result.get("end") or window_end.isoformat())
+    query = urlencode({"start": ref_start, "end": ref_end})
+    ref_type = "event" if attribution_result.get("source") == "prime_observer_incident" else "window"
+    return {
+        "type": ref_type,
+        "id": attribution_result.get("id"),
+        "path": "viz/investigate.html",
+        "url": f"viz/investigate.html?{query}",
+        "window_start": ref_start,
+        "window_end": ref_end,
+        "build_command_args": ["--start", ref_start, "--end", ref_end],
+    }
+
+
+def evidence_window(window_start: dt.datetime | None, window_end: dt.datetime | None) -> dict[str, Any] | None:
+    if window_start is None or window_end is None:
+        return None
+    timezone = window_start.tzname() or "unknown"
+    return {
+        "source": "prime_observer",
+        "window_start": window_start,
+        "window_end": window_end,
+        "timezone": timezone,
+        "granularity": f"{policy.TURBULENCE_BUCKET_MINUTES}-minute bucket",
+    }
+
+
+def event_status_from_inputs(
+    wan_health: dict[str, Any],
+    sustained_buckets: list[dict[str, Any]],
+    turbulence_buckets: list[dict[str, Any]],
+    pattern: dict[str, Any],
+    report_attribution_result: dict[str, Any],
+    raw_spikes: list[SeriesPoint],
+) -> str:
+    if wan_health.get("samples", 0) == 0:
+        return "Watch"
+    if sustained_buckets:
+        return "Attention"
+    if (
+        report_attribution_result.get("label") == "Likely local LAN / Wi-Fi"
+        and report_attribution_result.get("confidence") == "High"
+    ):
+        return "Attention"
+    if report_attribution_result.get("label") in {"Likely local LAN / Wi-Fi", "Likely upstream ISP / path"}:
+        return "Watch"
+    if turbulence_buckets:
+        return "Watch"
+    if len(raw_spikes) >= policy.TURBULENCE_MIN_RAW_BAD:
+        return "Watch"
+    if pattern.get("label") == "Highly elevated for this time of day" and pattern.get("confidence") in {"Medium", "High"}:
+        return "Watch"
+    return "Healthy"
+
+
+def event_issue_location(status: str, attribution_result: dict[str, Any]) -> str:
+    if status == "Healthy":
+        return ""
+    label = attribution_result.get("label", "")
+    if label == "Likely local LAN / Wi-Fi":
+        return "Likely local Wi-Fi/router issue"
+    if label == "Likely upstream ISP / path":
+        return "Likely upstream/ISP issue"
+    return "No clear source identified"
+
+
+def event_recommended_action(status: str, location: str) -> str:
+    if status == "Healthy":
+        return "None."
+    if status == "Watch":
+        return "No action unless people noticed slow calls, buffering, gaming lag, or dropped connections."
+    if location == "Likely local Wi-Fi/router issue":
+        return "Check the router or Wi-Fi if people noticed symptoms during the affected time."
+    if location == "Likely upstream/ISP issue":
+        return "No home-network change is suggested. Check provider status or contact the ISP only if symptoms matched the affected time."
+    return "Check whether symptoms matched the affected time. If this repeats, compare it with what people were doing."
+
+
+def event_window_from_buckets(buckets: list[dict[str, Any]]) -> tuple[dt.datetime | None, dt.datetime | None]:
+    if not buckets:
+        return None, None
+    return min(b["start"] for b in buckets), max(b["end"] for b in buckets)
+
+
+def build_event_metadata(
+    wan_health: dict[str, Any],
+    sustained_buckets: list[dict[str, Any]],
+    turbulence_buckets: list[dict[str, Any]],
+    raw_spikes: list[SeriesPoint],
+    pattern: dict[str, Any],
+    report_attribution_result: dict[str, Any],
+    window_start: dt.datetime | None,
+    window_end: dt.datetime | None,
+) -> list[dict[str, Any]]:
+    status = event_status_from_inputs(
+        wan_health,
+        sustained_buckets,
+        turbulence_buckets,
+        pattern,
+        report_attribution_result,
+        raw_spikes,
+    )
+    if status == "Healthy":
+        return []
+
+    if sustained_buckets:
+        kind = "sustained_slowdown"
+        affected_start, affected_end = event_window_from_buckets(sustained_buckets)
+        summary = f"{len(sustained_buckets)} sustained slowdown period(s) were found."
+        why = "Sustained slowdown was detected, which means user impact was possible."
+    elif turbulence_buckets:
+        kind = "turbulence"
+        affected_start, affected_end = event_window_from_buckets(turbulence_buckets)
+        summary = "Brief instability repeated enough to be worth noting."
+        why = "Brief instability repeated enough to be noteworthy, but it was not actionable because no sustained slowdown was detected."
+    elif len(raw_spikes) >= policy.TURBULENCE_MIN_RAW_BAD:
+        kind = "isolated_instability"
+        affected_start = min(p.ts for p in raw_spikes) if raw_spikes else window_start
+        affected_end = max(p.ts for p in raw_spikes) if raw_spikes else window_end
+        summary = f"{len(raw_spikes)} brief unstable moments were found."
+        why = "Brief instability repeated enough to be noteworthy, but the events did not continue long enough to suggest user impact."
+    elif pattern.get("label") == "Highly elevated for this time of day" and pattern.get("confidence") in {"Medium", "High"}:
+        kind = "baseline_slowdown"
+        latest = pattern.get("latest")
+        affected_start = latest.ts if isinstance(latest, SeriesPoint) else window_start
+        affected_end = latest.ts if isinstance(latest, SeriesPoint) else window_end
+        summary = "Performance was unusually slow compared with the normal pattern for that time of day."
+        why = "Performance was noticeably different from historical norms, but no sustained instability or user-impacting issue was detected."
+    else:
+        kind = "watch"
+        affected_start, affected_end = window_start, window_end
+        summary = "Something notable appeared in the latest telemetry."
+        why = "Something was notable enough to watch, but no sustained instability or user-impacting issue was detected."
+
+    location = event_issue_location(status, report_attribution_result)
+    reference = prime_observer_reference(affected_start, affected_end, report_attribution_result)
+    reference_id = reference.get("id") or reference.get("url") if reference else None
+    event = {
+        "id": stable_event_id(kind, affected_start, affected_end, report_attribution_result.get("source", ""), reference_id),
+        "kind": kind,
+        "status": status,
+        "severity": severity_for_status(status),
+        "confidence": normalize_confidence(report_attribution_result.get("confidence") or pattern.get("confidence")),
+        "window_start": affected_start,
+        "window_end": affected_end,
+        "summary": summary,
+        "why": why,
+        "recommended_action": event_recommended_action(status, location),
+        "issue_location": location,
+        "attribution_source": report_attribution_result.get("source", "core_signal_fallback"),
+        "prime_observer_reference": reference,
+        "evidence_window": evidence_window(affected_start, affected_end),
+    }
+    return [event]
+
+
 def dns_context(dns: dict[str, Any] | None, end: dt.datetime | None) -> dict[str, Any]:
     if not dns or dns.get("status") != "ok" or not isinstance(dns.get("summary"), dict):
         return {"available": False, "summary": "DNS/security context unavailable."}
@@ -447,6 +653,9 @@ def analyze(
     raw_spikes = [p for p in wan if p.raw_bad and not p.sustained_bad]
     fallback_report_attribution = with_fallback_source(report_attribution(wan, lan, buckets))
     exported_report_attribution = normalize_exported_attribution(exported_attribution, len(sustained_buckets))
+    report_attribution_result = exported_report_attribution or fallback_report_attribution
+    wan_health = stats_for(wan)
+    pattern = pattern_context(wan)
 
     return {
         "window_start": start,
@@ -456,16 +665,26 @@ def analyze(
             "lan_points": len(lan),
             "wan_points": len(wan),
         },
-        "wan_health": stats_for(wan),
+        "wan_health": wan_health,
         "wan_by_phase": {phase: stats_for(points) for phase, points in sorted(by_phase.items())},
-        "pattern": pattern_context(wan),
+        "pattern": pattern,
         "attribution": attribution(wan, lan, end),
-        "report_attribution": exported_report_attribution or fallback_report_attribution,
+        "report_attribution": report_attribution_result,
         "fallback_report_attribution": fallback_report_attribution,
         "buckets": buckets,
         "sustained_buckets": sustained_buckets,
         "turbulence_buckets": turbulence_buckets,
         "raw_spikes": raw_spikes,
+        "events": build_event_metadata(
+            wan_health,
+            sustained_buckets,
+            turbulence_buckets,
+            raw_spikes,
+            pattern,
+            report_attribution_result,
+            start,
+            end,
+        ),
         "dns": dns_context(dns, end),
         "warnings": list(warnings or []),
         "ignored_hosts": dict(ignored_hosts or {}),

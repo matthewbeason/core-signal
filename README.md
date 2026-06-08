@@ -304,6 +304,29 @@ prefers per-incident attribution for sustained slowdowns, then window-level
 attribution, then current attribution. If the export is missing or unusable,
 Core Signal falls back to its deterministic local attribution logic.
 
+## Event Metadata
+
+Morning-brief analysis includes an additive `events` list for downstream
+consumers. Each Core Signal event is interpretation and navigation metadata:
+deterministic `core-signal-...` ID, event kind, status, severity, confidence,
+affected window, summary, why, recommended action, issue location, attribution
+source, and a compact Prime Observer reference when an evidence window is
+navigable.
+
+Prime Observer v0.5.0 owns the historical investigation workflow:
+`bin/build_investigation.py` writes `viz/investigation.json`, and
+`viz/investigate.html` renders the local evidence view. Core Signal does not
+copy timelines, samples, DNS details, or investigation presentation. It only
+points to `viz/investigate.html?start=...&end=...` and includes matching
+`--start`/`--end` command arguments so Olivaw or another local consumer can
+navigate to or generate the Prime Observer evidence view.
+
+Downstream consumers should use Core Signal event IDs for stable interpreted
+events, affected windows for matching or grouping, and Prime Observer references
+for local evidence navigation. If Prime Observer does not provide an incident
+ID, Core Signal still emits a deterministic event ID and an honest time-window
+reference rather than inventing an upstream ID.
+
 ## DNS Interpretation
 
 Weekly pattern reports include a DNS Interpretation section when the optional

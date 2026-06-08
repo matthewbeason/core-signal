@@ -164,6 +164,17 @@ def attribution_source_note(analysis: dict[str, Any]) -> str:
     return "Attribution source: Core Signal fallback"
 
 
+def event_reference_note(analysis: dict[str, Any]) -> str | None:
+    events = analysis.get("events") or []
+    if not events:
+        return None
+    reference = (events[0].get("prime_observer_reference") or {}) if isinstance(events[0], dict) else {}
+    url = reference.get("url")
+    if not url:
+        return None
+    return f"Prime Observer investigation: {url}"
+
+
 def pattern_note(pattern: dict[str, Any]) -> str | None:
     label = pattern.get("label")
     if pattern.get("latest") is None:
@@ -275,8 +286,11 @@ def compact_evidence_lines(analysis: dict[str, Any]) -> list[str]:
     note = source_evidence_note(analysis)
     if note:
         lines.append(f"- {note}")
+    reference = event_reference_note(analysis)
+    if reference:
+        lines.append(f"- {reference}")
     lines.append(f"- {attribution_source_note(analysis)}")
-    lines.append("- Prime Observer policy: v0.4.1-aligned")
+    lines.append("- Prime Observer policy: v0.5.0-aligned")
     return lines
 
 
