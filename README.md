@@ -325,6 +325,37 @@ Significant events normalize the following explanation fields:
 - `confidence_reason`: why the confidence value is appropriate for this event.
 - `interpretation_source`: always `core_signal` for Core Signal events.
 - `related_events`: an additive list reserved for future relationship metadata.
+- `uncertainties`: optional limitation notes or unresolved questions that Core
+  Signal can state from the existing event context.
+- `attribution_assessment`: optional attribution summary with a candidate,
+  confidence, and reason. This summarizes Core Signal's interpretation of
+  available local-vs-internet attribution; it does not create new evidence.
+- `evidence_strength`: optional evidence-quality summary with a rating and
+  reason grounded in the available supporting facts and event shape.
+
+Example Wave 3A event metadata:
+
+```json
+{
+  "uncertainties": [
+    "Unable to distinguish ISP congestion from transient routing issues using the available telemetry."
+  ],
+  "attribution_assessment": {
+    "candidate": "upstream",
+    "confidence": "medium",
+    "reason": "WAN degraded while LAN remained healthy."
+  },
+  "evidence_strength": {
+    "rating": "moderate",
+    "reason": "A sustained WAN period was observed with supporting attribution context."
+  }
+}
+```
+
+These fields are additive and optional. Consumers must continue to tolerate
+events that omit any or all of them. Core Signal emits them only when the
+existing event interpretation supports the claim; for example, a generic watch
+event may keep the older event shape without Wave 3A metadata.
 
 Recommendations are not emitted as orphan claims. An event recommendation is
 paired with `recommendation_trace`, which points back to the event ID, the
@@ -358,6 +389,13 @@ presentation. It only points to compact local references such as
 `viz/investigate.html?start=...&end=...` and includes matching `--start`/`--end`
 command arguments so Olivaw or another local consumer can navigate to or
 generate the Prime Observer evidence view.
+
+Core Signal owns interpretation, recommendations, confidence, uncertainty
+summaries, evidence-strength summaries, attribution confidence, and event
+metadata. It may summarize what remains uncertain, how strong the evidence is,
+and how confident the attribution appears from existing facts. It may not invent
+evidence, modify Prime Observer facts, claim unsupported certainty, or perform
+causal attribution beyond the available evidence.
 
 Olivaw owns presentation, synthesis, navigation, and attribution display. Core
 Signal does not add Olivaw formatting to event metadata; it emits structured

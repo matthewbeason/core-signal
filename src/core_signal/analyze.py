@@ -501,6 +501,118 @@ def confidence_reason(confidence: str, attribution_result: dict[str, Any], statu
     return "Confidence was limited because Core Signal could not find enough supporting evidence for a stronger judgment."
 
 
+def attribution_candidate(label: str) -> str | None:
+    if label == "Likely upstream ISP / path":
+        return "upstream"
+    if label == "Likely local LAN / Wi-Fi":
+        return "local"
+    if label in {"No issue detected", "No recent issue detected"}:
+        return "none"
+    if label == "No clear source identified":
+        return "unknown"
+    return None
+
+
+def attribution_assessment(
+    status: str,
+    attribution_result: dict[str, Any],
+) -> dict[str, str] | None:
+    if status == "Healthy":
+        return None
+    label = str(attribution_result.get("label") or "")
+    candidate = attribution_candidate(label)
+    if candidate is None or candidate == "none":
+        return None
+
+    confidence = normalize_confidence(attribution_result.get("confidence"))
+    if confidence == "Unknown":
+        confidence = "Low"
+    reason = str(attribution_result.get("why") or "").strip()
+    if not reason:
+        if candidate == "upstream":
+            reason = "WAN degraded while LAN remained healthy."
+        elif candidate == "local":
+            reason = "Local gateway evidence was elevated."
+        else:
+            reason = "Available local-vs-internet evidence did not clearly identify a source."
+    return {
+        "candidate": candidate,
+        "confidence": confidence.lower(),
+        "reason": reason,
+    }
+
+
+def uncertainty_notes(
+    kind: str,
+    status: str,
+    attribution_result: dict[str, Any],
+) -> list[str]:
+    if status == "Healthy" or kind == "watch":
+        return []
+
+    notes: list[str] = []
+    label = str(attribution_result.get("label") or "")
+    source = str(attribution_result.get("source") or "")
+    if label == "Likely upstream ISP / path":
+        notes.append("Unable to distinguish ISP congestion from transient routing issues using the available telemetry.")
+    elif label == "Likely local LAN / Wi-Fi":
+        notes.append("Unable to identify the specific local device, Wi-Fi segment, or router condition from the available telemetry.")
+    elif label in {"No clear source identified", ""}:
+        notes.append("Available local-vs-internet evidence does not clearly identify whether the source was local or upstream.")
+
+    if kind in {"turbulence", "isolated_instability"}:
+        notes.append("Brief instability did not persist long enough to estimate user impact with high confidence.")
+    if source == "prime_observer_current" and status == "Attention":
+        notes.append("Prime Observer attribution describes current state rather than the historical event window.")
+    return notes
+
+
+def evidence_strength(
+    kind: str,
+    sustained_buckets: list[dict[str, Any]],
+    turbulence_buckets: list[dict[str, Any]],
+    raw_spikes: list[SeriesPoint],
+    pattern: dict[str, Any],
+    supporting_facts: list[dict[str, Any]],
+) -> dict[str, str] | None:
+    if kind == "watch":
+        return None
+    if kind == "sustained_slowdown":
+        if len(sustained_buckets) >= 2:
+            return {
+                "rating": "strong",
+                "reason": f"{len(sustained_buckets)} sustained WAN period(s) were observed.",
+            }
+        return {
+            "rating": "moderate",
+            "reason": "A sustained WAN period was observed with supporting attribution context.",
+        }
+    if kind == "turbulence":
+        return {
+            "rating": "limited",
+            "reason": "Repeated WAN instability was observed, but it did not become sustained.",
+        }
+    if kind == "isolated_instability":
+        return {
+            "rating": "limited",
+            "reason": f"{len(raw_spikes)} raw WAN threshold crossing(s) were observed without sustained persistence.",
+        }
+    if kind == "baseline_slowdown":
+        confidence = normalize_confidence(pattern.get("confidence"))
+        sample_count = pattern.get("sample_count")
+        rating = "moderate" if confidence in {"Medium", "High"} else "limited"
+        return {
+            "rating": rating,
+            "reason": f"Historical baseline comparison used {sample_count} comparable sample(s) with {confidence.lower()} confidence.",
+        }
+    if supporting_facts:
+        return {
+            "rating": "limited",
+            "reason": "Core Signal found supporting facts, but not enough structure for stronger evidence quality.",
+        }
+    return None
+
+
 def event_confidence(status: str, kind: str, attribution_result: dict[str, Any], pattern: dict[str, Any]) -> str:
     if attribution_result.get("source") == "prime_observer_current" and status == "Attention":
         return "Medium"
@@ -721,13 +833,14 @@ def build_event_metadata(
         pattern,
     )
     event_id = stable_event_id(kind, affected_start, affected_end, report_attribution_result.get("source", ""), reference_id)
+    reason = confidence_reason(confidence, report_attribution_result, status, kind)
     event = {
         "id": event_id,
         "kind": kind,
         "status": status,
         "severity": severity_for_status(status),
         "confidence": confidence,
-        "confidence_reason": confidence_reason(confidence, report_attribution_result, status, kind),
+        "confidence_reason": reason,
         "window_start": affected_start,
         "window_end": affected_end,
         "summary": summary,
@@ -738,7 +851,7 @@ def build_event_metadata(
             "event_id": event_id,
             "supporting_fact_ids": [fact["id"] for fact in supporting_facts],
             "confidence": confidence,
-            "confidence_reason": confidence_reason(confidence, report_attribution_result, status, kind),
+            "confidence_reason": reason,
         },
         "issue_location": location,
         "interpretation_source": "core_signal",
@@ -747,6 +860,15 @@ def build_event_metadata(
         "evidence_window": evidence_window(affected_start, affected_end),
         "related_events": [],
     }
+    uncertainties = uncertainty_notes(kind, status, report_attribution_result)
+    assessment = None if kind == "watch" else attribution_assessment(status, report_attribution_result)
+    strength = evidence_strength(kind, sustained_buckets, turbulence_buckets, raw_spikes, pattern, supporting_facts)
+    if uncertainties:
+        event["uncertainties"] = uncertainties
+    if assessment is not None:
+        event["attribution_assessment"] = assessment
+    if strength is not None:
+        event["evidence_strength"] = strength
     return [event]
 
 

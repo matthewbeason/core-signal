@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -459,6 +460,68 @@ class CoreSignalTests(unittest.TestCase):
         self.assertTrue(event["confidence_reason"])
         self.assertIsInstance(event["supporting_facts"], list)
         self.assertIsInstance(event["related_events"], list)
+
+    def test_sustained_slowdown_event_emits_uncertainty_attribution_and_evidence_strength(self) -> None:
+        result = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+        )
+        event = result["events"][0]
+        self.assertEqual(event["kind"], "sustained_slowdown")
+        self.assertIn("uncertainties", event)
+        self.assertIn(
+            "Unable to distinguish ISP congestion from transient routing issues using the available telemetry.",
+            event["uncertainties"],
+        )
+        self.assertEqual(
+            event["attribution_assessment"],
+            {
+                "candidate": "upstream",
+                "confidence": "high",
+                "reason": "Internet-side degradation was detected while local gateway evidence stayed stable (0/2 elevated local samples).",
+            },
+        )
+        self.assertEqual(event["evidence_strength"]["rating"], "moderate")
+        self.assertIn("sustained WAN period", event["evidence_strength"]["reason"])
+
+    def test_new_event_metadata_is_json_serializable(self) -> None:
+        result = analyze(
+            [
+                obs(0, "192.168.1.1", 20),
+                obs(0, "1.1.1.1", 160),
+                obs(1, "192.168.1.1", 20),
+                obs(1, "1.1.1.1", 170),
+            ],
+            None,
+        )
+        event = result["events"][0]
+        payload = {
+            "uncertainties": event["uncertainties"],
+            "attribution_assessment": event["attribution_assessment"],
+            "evidence_strength": event["evidence_strength"],
+        }
+        self.assertEqual(json.loads(json.dumps(payload, sort_keys=True)), payload)
+
+    def test_generic_watch_event_keeps_new_metadata_optional_for_backward_compatibility(self) -> None:
+        exported = {
+            "window_attribution": {
+                "status": "likely_upstream",
+                "label": "Likely upstream (ISP / path)",
+                "confidence": "medium",
+                "evidence": ["window-level attribution was present"],
+            }
+        }
+        result = analyze([obs(0, "1.1.1.1", 20), obs(0, "192.168.1.1", 10)], None, exported)
+        event = result["events"][0]
+        self.assertEqual(event["kind"], "watch")
+        self.assertNotIn("uncertainties", event)
+        self.assertNotIn("attribution_assessment", event)
+        self.assertNotIn("evidence_strength", event)
 
     def test_recommendations_are_traceable_to_event_facts_and_confidence(self) -> None:
         result = analyze(
