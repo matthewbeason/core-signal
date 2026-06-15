@@ -305,6 +305,27 @@ prefers per-incident attribution for sustained slowdowns, then window-level
 attribution, then current attribution. If the export is missing or unusable,
 Core Signal falls back to its deterministic local attribution logic.
 
+Prime Observer may also include factual target-group evidence in the attribution
+export or investigation artifacts. Core Signal reads additive fields such as
+`target_groups`, `target_group_facts`, `internet_probe_summary`,
+`resolver_probe_summary`, and `gateway_probe_summary` when they are present.
+Prime Observer owns the target classification and factual summaries:
+`internet_probe` targets such as Cloudflare and Quad9, `resolver_probe` targets
+such as NextDNS primary and secondary, and the `gateway_probe` target for the
+local gateway.
+
+Core Signal uses those factual groups only as interpretation input. For example,
+internet-probe degradation with healthy resolver and gateway probes points to a
+general internet/path problem rather than the resolver path; resolver-probe
+degradation with healthy internet and gateway probes points more toward a
+resolver-path or DNS provider path issue; internet and resolver degradation
+together points to a broader upstream/WAN path that does not isolate DNS; and
+gateway degradation adds local gateway/LAN ambiguity. These judgments refine
+`attribution_assessment`, `uncertainties`, `evidence_strength`, and compact
+`supporting_facts` without copying raw telemetry or Prime Observer evidence
+blobs. Olivaw remains responsible for presenting the resulting Core Signal
+interpretation.
+
 ## Event Metadata
 
 Morning-brief analysis includes an additive `events` list for downstream

@@ -311,7 +311,133 @@ def normalize_attribution_label(raw_label: str, raw_status: str) -> str:
     return "No clear source identified"
 
 
-def normalize_prime_observer_attribution_entry(entry: dict[str, Any], source: str) -> dict[str, Any] | None:
+TARGET_GROUP_LABELS = {
+    "1.1.1.1": "Cloudflare",
+    "9.9.9.9": "Quad9",
+    "45.90.28.134": "NextDNS primary",
+    "45.90.30.134": "NextDNS secondary",
+    policy.GATEWAY_HOST: "local gateway",
+}
+
+TARGET_GROUP_NAMES = {
+    "internet_probe": "Internet probes",
+    "resolver_probe": "Resolver probes",
+    "gateway_probe": "Gateway probe",
+}
+
+
+def compact_join(items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def as_mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def int_value(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def target_labels(group: dict[str, Any]) -> list[str]:
+    counts = as_mapping(group.get("host_counts"))
+    labels = [TARGET_GROUP_LABELS.get(str(host), str(host)) for host in counts if str(host)]
+    return sorted(dict.fromkeys(labels))
+
+
+def group_counts(group: dict[str, Any]) -> dict[str, int]:
+    return {
+        "sample_count": int_value(group.get("sample_count")),
+        "raw_bad": int_value(group.get("raw_bad_samples", group.get("raw_bad_count"))),
+        "sustained_bad": int_value(group.get("sustained_bad_samples", group.get("sustained_bad_count"))),
+        "turbulence_buckets": int_value(group.get("turbulence_buckets")),
+    }
+
+
+def group_state(group: dict[str, Any]) -> str:
+    counts = group_counts(group)
+    if counts["sustained_bad"] > 0 or counts["turbulence_buckets"] > 0 or counts["raw_bad"] > 0:
+        return "degraded"
+    if counts["sample_count"] > 0:
+        return "healthy"
+    return "unknown"
+
+
+def target_group_context(*sources: dict[str, Any]) -> dict[str, Any] | None:
+    groups: dict[str, dict[str, Any]] = {}
+    facts: list[str] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for fact in source.get("target_group_facts") or []:
+            fact_text = str(fact).strip()
+            if fact_text:
+                facts.append(fact_text)
+        source_groups = as_mapping(source.get("target_groups"))
+        for group_name, group in source_groups.items():
+            if isinstance(group, dict):
+                groups[str(group_name)] = group
+        for group_name in ("internet_probe", "resolver_probe", "gateway_probe"):
+            summary = source.get(f"{group_name}_summary")
+            if isinstance(summary, dict):
+                groups[group_name] = summary
+
+    metrics = next((source for source in sources if isinstance(source, dict) and "lan_bad" in source), {})
+    if isinstance(metrics, dict) and "gateway_probe" not in groups and int_value(metrics.get("lan_recent_samples")):
+        lan_bad = bool(metrics.get("lan_bad"))
+        groups["gateway_probe"] = {
+            "sample_count": metrics.get("lan_recent_samples"),
+            "raw_bad_samples": metrics.get("lan_elevated_samples") if lan_bad else 0,
+            "sustained_bad_samples": metrics.get("lan_elevated_samples") if lan_bad else 0,
+            "host_counts": {policy.GATEWAY_HOST: metrics.get("lan_recent_samples")},
+        }
+
+    if not groups and not facts:
+        return None
+
+    states = {name: group_state(group) for name, group in groups.items()}
+    labels = {name: target_labels(group) for name, group in groups.items()}
+    sparse = {
+        name: group_counts(group)["sample_count"] > 0 and group_counts(group)["sample_count"] < 16
+        for name, group in groups.items()
+    }
+    return {
+        "facts": list(dict.fromkeys(facts)),
+        "groups": groups,
+        "states": states,
+        "labels": labels,
+        "sparse": sparse,
+    }
+
+
+def merge_target_group_contexts(*contexts: dict[str, Any] | None) -> dict[str, Any] | None:
+    groups: dict[str, dict[str, Any]] = {}
+    facts: list[str] = []
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        groups.update(as_mapping(context.get("groups")))
+        facts.extend(str(fact) for fact in context.get("facts") or [] if str(fact).strip())
+    if not groups and not facts:
+        return None
+    return target_group_context({"target_groups": groups, "target_group_facts": list(dict.fromkeys(facts))})
+
+
+def normalize_prime_observer_attribution_entry(
+    entry: dict[str, Any],
+    source: str,
+    root_target_context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(entry, dict):
         return None
     raw_label = str(entry.get("label") or entry.get("attribution_label") or "").strip()
@@ -326,7 +452,7 @@ def normalize_prime_observer_attribution_entry(entry: dict[str, Any], source: st
         metrics = entry["attribution_evidence"]
     else:
         summary = str(entry.get("why") or raw_label or "Prime Observer attribution export was present.").strip()
-    return {
+    normalized = {
         "label": normalize_attribution_label(raw_label, raw_status),
         "confidence": confidence or "Unknown",
         "why": summary,
@@ -340,15 +466,22 @@ def normalize_prime_observer_attribution_entry(entry: dict[str, Any], source: st
         "evidence": evidence,
         "metrics": metrics,
     }
+    context = merge_target_group_contexts(
+        root_target_context,
+        target_group_context(entry, metrics),
+    )
+    if context is not None:
+        normalized["target_group_context"] = context
+    return normalized
 
 
-def select_incident_attribution(incidents: Any) -> dict[str, Any] | None:
+def select_incident_attribution(incidents: Any, root_target_context: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if not isinstance(incidents, list) or not incidents:
         return None
     normalized = [
         item
         for item in (
-            normalize_prime_observer_attribution_entry(incident, "prime_observer_incident")
+            normalize_prime_observer_attribution_entry(incident, "prime_observer_incident", root_target_context)
             for incident in incidents
         )
         if item is not None
@@ -373,14 +506,16 @@ def normalize_exported_attribution(
     if not isinstance(exported, dict):
         return None
 
+    root_target_context = target_group_context(exported)
     if sustained_count:
-        incident = select_incident_attribution(exported.get("incidents"))
+        incident = select_incident_attribution(exported.get("incidents"), root_target_context)
         if incident is not None:
             return incident
 
     window = normalize_prime_observer_attribution_entry(
         exported.get("window_attribution"),
         "prime_observer_window",
+        root_target_context,
     )
     if window is not None:
         return window
@@ -388,6 +523,7 @@ def normalize_exported_attribution(
     current = normalize_prime_observer_attribution_entry(
         exported.get("current_attribution"),
         "prime_observer_current",
+        root_target_context,
     )
     if current is not None:
         return current
@@ -399,7 +535,7 @@ def normalize_exported_attribution(
         "attribution_evidence": exported.get("attribution_evidence"),
         "generated_at": exported.get("generated_at"),
     }
-    return normalize_prime_observer_attribution_entry(legacy, "prime_observer_current")
+    return normalize_prime_observer_attribution_entry(legacy, "prime_observer_current", root_target_context)
 
 
 def severity_for_status(status: str) -> str:
@@ -513,12 +649,75 @@ def attribution_candidate(label: str) -> str | None:
     return None
 
 
+def target_group_pattern(context: dict[str, Any] | None) -> dict[str, str] | None:
+    if not isinstance(context, dict):
+        return None
+    states = as_mapping(context.get("states"))
+    internet = states.get("internet_probe", "unknown")
+    resolver = states.get("resolver_probe", "unknown")
+    gateway = states.get("gateway_probe", "unknown")
+    resolver_sparse = bool(as_mapping(context.get("sparse")).get("resolver_probe"))
+
+    if gateway == "degraded" and (internet == "degraded" or resolver == "degraded"):
+        return {
+            "candidate": "local",
+            "confidence": "medium",
+            "reason": (
+                "Gateway probe degraded alongside WAN target groups, so local gateway/LAN involvement is likely; "
+                "upstream involvement may also be present."
+            ),
+        }
+    if internet == "degraded" and resolver == "healthy" and gateway == "healthy":
+        return {
+            "candidate": "upstream",
+            "confidence": "high" if not resolver_sparse else "medium",
+            "reason": (
+                "Internet probes degraded while resolver and gateway probes remained healthy, "
+                "pointing to general internet/path degradation rather than the resolver path."
+            ),
+        }
+    if resolver == "degraded" and internet == "healthy" and gateway == "healthy":
+        return {
+            "candidate": "resolver_path",
+            "confidence": "medium" if resolver_sparse else "high",
+            "reason": (
+                "Resolver probes degraded while internet and gateway probes remained healthy, "
+                "making a resolver-path or DNS provider path issue more likely."
+            ),
+        }
+    if internet == "degraded" and resolver == "degraded" and gateway == "healthy":
+        return {
+            "candidate": "upstream",
+            "confidence": "medium" if resolver_sparse else "high",
+            "reason": (
+                "Internet and resolver probes both degraded while the gateway probe remained healthy, "
+                "pointing to a broader upstream/WAN path issue without isolating DNS."
+            ),
+        }
+    if internet == "degraded" and gateway == "healthy":
+        return {
+            "candidate": "upstream",
+            "confidence": "medium",
+            "reason": "Internet probes degraded while gateway evidence remained healthy.",
+        }
+    if resolver == "degraded" and gateway == "healthy":
+        return {
+            "candidate": "resolver_path",
+            "confidence": "low" if resolver_sparse else "medium",
+            "reason": "Resolver probes degraded while gateway evidence remained healthy.",
+        }
+    return None
+
+
 def attribution_assessment(
     status: str,
     attribution_result: dict[str, Any],
 ) -> dict[str, str] | None:
     if status == "Healthy":
         return None
+    group_pattern = target_group_pattern(attribution_result.get("target_group_context"))
+    if group_pattern is not None:
+        return group_pattern
     label = str(attribution_result.get("label") or "")
     candidate = attribution_candidate(label)
     if candidate is None or candidate == "none":
@@ -547,13 +746,16 @@ def uncertainty_notes(
     status: str,
     attribution_result: dict[str, Any],
 ) -> list[str]:
-    if status == "Healthy" or kind == "watch":
+    target_context = attribution_result.get("target_group_context")
+    if status == "Healthy" or (kind == "watch" and not target_context):
         return []
 
     notes: list[str] = []
     label = str(attribution_result.get("label") or "")
     source = str(attribution_result.get("source") or "")
-    if label == "Likely upstream ISP / path":
+    if kind == "watch" and target_context:
+        pass
+    elif label == "Likely upstream ISP / path":
         notes.append("Unable to distinguish ISP congestion from transient routing issues using the available telemetry.")
     elif label == "Likely local LAN / Wi-Fi":
         notes.append("Unable to identify the specific local device, Wi-Fi segment, or router condition from the available telemetry.")
@@ -564,7 +766,72 @@ def uncertainty_notes(
         notes.append("Brief instability did not persist long enough to estimate user impact with high confidence.")
     if source == "prime_observer_current" and status == "Attention":
         notes.append("Prime Observer attribution describes current state rather than the historical event window.")
+    notes.extend(target_group_uncertainty_notes(attribution_result.get("target_group_context")))
     return notes
+
+
+def target_group_uncertainty_notes(context: dict[str, Any] | None) -> list[str]:
+    if not isinstance(context, dict):
+        return []
+    states = as_mapping(context.get("states"))
+    sparse = as_mapping(context.get("sparse"))
+    notes: list[str] = []
+    if sparse.get("resolver_probe"):
+        notes.append("Resolver probes do not yet have enough history to establish a stable baseline.")
+    if states.get("internet_probe") == "degraded" and states.get("resolver_probe") == "degraded":
+        notes.append("Both internet and resolver probes degraded, so the evidence does not isolate DNS from broader WAN path.")
+    if states.get("gateway_probe") == "degraded":
+        notes.append("Gateway probe degradation means local involvement cannot be ruled out.")
+    return list(dict.fromkeys(notes))
+
+
+def rating_index(rating: str) -> int:
+    return {"limited": 0, "moderate": 1, "strong": 2}.get(rating, 0)
+
+
+def rating_from_index(index: int) -> str:
+    return ["limited", "moderate", "strong"][max(0, min(index, 2))]
+
+
+def adjust_evidence_strength_for_target_groups(
+    strength: dict[str, str] | None,
+    context: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if strength is None or not isinstance(context, dict):
+        return strength
+    states = as_mapping(context.get("states"))
+    labels = as_mapping(context.get("labels"))
+    sparse = as_mapping(context.get("sparse"))
+    rating = rating_index(strength.get("rating", "limited"))
+    reasons: list[str] = []
+
+    degraded_group_count = sum(1 for state in states.values() if state == "degraded")
+    multi_target_group = any(
+        states.get(group_name) == "degraded" and len(labels.get(group_name) or []) >= 2
+        for group_name in ("internet_probe", "resolver_probe")
+    )
+    if multi_target_group:
+        rating += 1
+        reasons.append("multiple targets in the same probe class degraded")
+    if states.get("internet_probe") == "degraded" and states.get("resolver_probe") == "degraded" and states.get("gateway_probe") == "healthy":
+        rating += 1
+        reasons.append("internet and resolver probes agreed while the gateway stayed healthy")
+    elif degraded_group_count >= 2 and states.get("gateway_probe") != "degraded":
+        rating += 1
+        reasons.append("multiple probe classes agreed")
+    if states.get("gateway_probe") == "degraded":
+        rating -= 1
+        reasons.append("gateway degradation adds local-path ambiguity")
+    if sparse.get("resolver_probe") and states.get("resolver_probe") == "degraded":
+        rating -= 1
+        reasons.append("resolver probe history is limited")
+
+    if not reasons:
+        return strength
+    return {
+        "rating": rating_from_index(rating),
+        "reason": f"{strength.get('reason', '').rstrip('.')} with target-group context: {', '.join(reasons)}.",
+    }
 
 
 def evidence_strength(
@@ -574,43 +841,54 @@ def evidence_strength(
     raw_spikes: list[SeriesPoint],
     pattern: dict[str, Any],
     supporting_facts: list[dict[str, Any]],
+    target_context: dict[str, Any] | None = None,
 ) -> dict[str, str] | None:
     if kind == "watch":
-        return None
+        if target_context is None:
+            return None
+        return adjust_evidence_strength_for_target_groups(
+            {
+                "rating": "limited",
+                "reason": "Target-group evidence was present, but the event did not meet stronger Core Signal persistence thresholds.",
+            },
+            target_context,
+        )
+    strength: dict[str, str] | None = None
     if kind == "sustained_slowdown":
         if len(sustained_buckets) >= 2:
-            return {
+            strength = {
                 "rating": "strong",
                 "reason": f"{len(sustained_buckets)} sustained WAN period(s) were observed.",
             }
-        return {
-            "rating": "moderate",
-            "reason": "A sustained WAN period was observed with supporting attribution context.",
-        }
-    if kind == "turbulence":
-        return {
+        else:
+            strength = {
+                "rating": "moderate",
+                "reason": "A sustained WAN period was observed with supporting attribution context.",
+            }
+    elif kind == "turbulence":
+        strength = {
             "rating": "limited",
             "reason": "Repeated WAN instability was observed, but it did not become sustained.",
         }
-    if kind == "isolated_instability":
-        return {
+    elif kind == "isolated_instability":
+        strength = {
             "rating": "limited",
             "reason": f"{len(raw_spikes)} raw WAN threshold crossing(s) were observed without sustained persistence.",
         }
-    if kind == "baseline_slowdown":
+    elif kind == "baseline_slowdown":
         confidence = normalize_confidence(pattern.get("confidence"))
         sample_count = pattern.get("sample_count")
         rating = "moderate" if confidence in {"Medium", "High"} else "limited"
-        return {
+        strength = {
             "rating": rating,
             "reason": f"Historical baseline comparison used {sample_count} comparable sample(s) with {confidence.lower()} confidence.",
         }
-    if supporting_facts:
-        return {
+    elif supporting_facts:
+        strength = {
             "rating": "limited",
             "reason": "Core Signal found supporting facts, but not enough structure for stronger evidence quality.",
         }
-    return None
+    return adjust_evidence_strength_for_target_groups(strength, target_context)
 
 
 def event_confidence(status: str, kind: str, attribution_result: dict[str, Any], pattern: dict[str, Any]) -> str:
@@ -625,6 +903,61 @@ def fact_reference_url(reference: dict[str, Any] | None) -> str | None:
     if not reference:
         return None
     return reference.get("url") or reference.get("path")
+
+
+def target_group_supporting_facts(context: dict[str, Any] | None, reference: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(context, dict):
+        return []
+    states = as_mapping(context.get("states"))
+    labels = as_mapping(context.get("labels"))
+    sparse = as_mapping(context.get("sparse"))
+    facts: list[dict[str, Any]] = []
+    for group_name in ("internet_probe", "resolver_probe"):
+        if states.get(group_name) != "degraded":
+            continue
+        target_list = compact_join(list(labels.get(group_name) or []))
+        if not target_list:
+            continue
+        facts.append(
+            {
+                "id": f"fact-{group_name.replace('_', '-')}",
+                "kind": "target_group_evidence",
+                "summary": f"{TARGET_GROUP_NAMES[group_name]} degraded: {target_list}.",
+                "source": "Prime Observer target grouping",
+                "reference": fact_reference_url(reference),
+            }
+        )
+    if states.get("gateway_probe") == "healthy":
+        facts.append(
+            {
+                "id": "fact-gateway-probe",
+                "kind": "target_group_evidence",
+                "summary": "Gateway probe remained below local threshold.",
+                "source": "Prime Observer target grouping",
+                "reference": fact_reference_url(reference),
+            }
+        )
+    elif states.get("gateway_probe") == "degraded":
+        facts.append(
+            {
+                "id": "fact-gateway-probe",
+                "kind": "target_group_evidence",
+                "summary": "Gateway probe also degraded.",
+                "source": "Prime Observer target grouping",
+                "reference": fact_reference_url(reference),
+            }
+        )
+    if sparse.get("resolver_probe"):
+        facts.append(
+            {
+                "id": "fact-resolver-history",
+                "kind": "target_group_evidence",
+                "summary": "Resolver probe history is limited.",
+                "source": "Prime Observer target grouping",
+                "reference": fact_reference_url(reference),
+            }
+        )
+    return facts
 
 
 def build_supporting_facts(
@@ -668,6 +1001,8 @@ def build_supporting_facts(
                 },
             }
         )
+
+    facts.extend(target_group_supporting_facts(report_attribution_result.get("target_group_context"), reference))
 
     if raw_spikes and kind in {"turbulence", "isolated_instability"}:
         facts.append(
@@ -728,6 +1063,8 @@ def event_status_from_inputs(
     ):
         return "Attention"
     if report_attribution_result.get("label") in {"Likely local LAN / Wi-Fi", "Likely upstream ISP / path"}:
+        return "Watch"
+    if target_group_pattern(report_attribution_result.get("target_group_context")) is not None:
         return "Watch"
     if turbulence_buckets:
         return "Watch"
@@ -861,8 +1198,16 @@ def build_event_metadata(
         "related_events": [],
     }
     uncertainties = uncertainty_notes(kind, status, report_attribution_result)
-    assessment = None if kind == "watch" else attribution_assessment(status, report_attribution_result)
-    strength = evidence_strength(kind, sustained_buckets, turbulence_buckets, raw_spikes, pattern, supporting_facts)
+    assessment = None if kind == "watch" and "target_group_context" not in report_attribution_result else attribution_assessment(status, report_attribution_result)
+    strength = evidence_strength(
+        kind,
+        sustained_buckets,
+        turbulence_buckets,
+        raw_spikes,
+        pattern,
+        supporting_facts,
+        report_attribution_result.get("target_group_context"),
+    )
     if uncertainties:
         event["uncertainties"] = uncertainties
     if assessment is not None:

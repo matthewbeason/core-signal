@@ -86,6 +86,67 @@ def section(markdown: str, heading: str) -> str:
     return body if next_heading == -1 else body[:next_heading]
 
 
+def target_group(
+    hosts: list[str],
+    degraded: bool,
+    samples: int = 20,
+    sustained_bad: int | None = None,
+    raw_bad: int | None = None,
+) -> dict[str, object]:
+    host_count = max(samples // max(len(hosts), 1), 1)
+    return {
+        "sample_count": samples,
+        "host_counts": {host: host_count for host in hosts},
+        "raw_bad_samples": raw_bad if raw_bad is not None else (samples if degraded else 0),
+        "sustained_bad_samples": sustained_bad if sustained_bad is not None else (samples if degraded else 0),
+        "turbulence_buckets": 0,
+    }
+
+
+def target_group_export(
+    *,
+    internet: bool,
+    resolver: bool,
+    gateway: bool,
+    resolver_samples: int = 20,
+    status: str = "likely_upstream",
+    label: str = "Likely upstream (ISP / path)",
+) -> dict[str, object]:
+    groups = {
+        "internet_probe": target_group(["1.1.1.1", "9.9.9.9"], internet),
+        "resolver_probe": target_group(["45.90.28.134", "45.90.30.134"], resolver, samples=resolver_samples),
+        "gateway_probe": target_group(["192.168.1.1"], gateway),
+    }
+    return {
+        "window_attribution": {
+            "status": status,
+            "label": label,
+            "confidence": "high",
+            "evidence": ["Prime Observer target-group attribution was present."],
+            "metrics": {
+                "target_group_facts": [
+                    f"Internet probe degraded: {internet}.",
+                    f"Resolver probe degraded: {resolver}.",
+                    f"Gateway probe degraded: {gateway}.",
+                ],
+                "target_groups": groups,
+                "internet_probe_summary": groups["internet_probe"],
+                "resolver_probe_summary": groups["resolver_probe"],
+                "gateway_probe_summary": groups["gateway_probe"],
+            },
+        }
+    }
+
+
+def sustained_internet_observations() -> list[Observation]:
+    return [
+        obs(0, "192.168.1.1", 20),
+        obs(0, "1.1.1.1", 160),
+        obs(1, "192.168.1.1", 20),
+        obs(1, "1.1.1.1", 170),
+    ]
+
+
 class CoreSignalTests(unittest.TestCase):
     def test_missing_dns_is_optional(self) -> None:
         self.assertIsNone(read_dns_summary(Path("/tmp/does-not-exist-core-signal.json")))
@@ -506,6 +567,124 @@ class CoreSignalTests(unittest.TestCase):
             "evidence_strength": event["evidence_strength"],
         }
         self.assertEqual(json.loads(json.dumps(payload, sort_keys=True)), payload)
+
+    def test_target_group_internet_degraded_resolver_and_gateway_healthy(self) -> None:
+        result = analyze(
+            sustained_internet_observations(),
+            None,
+            target_group_export(internet=True, resolver=False, gateway=False),
+        )
+        event = result["events"][0]
+        self.assertEqual(event["attribution_assessment"]["candidate"], "upstream")
+        self.assertIn("general internet/path degradation", event["attribution_assessment"]["reason"])
+        self.assertIn("rather than the resolver path", event["attribution_assessment"]["reason"])
+        summaries = [fact["summary"] for fact in event["supporting_facts"]]
+        self.assertIn("Internet probes degraded: Cloudflare and Quad9.", summaries)
+        self.assertIn("Gateway probe remained below local threshold.", summaries)
+        self.assertEqual(event["evidence_strength"]["rating"], "strong")
+
+    def test_target_group_resolver_degraded_internet_and_gateway_healthy(self) -> None:
+        exported = target_group_export(
+            internet=False,
+            resolver=True,
+            gateway=False,
+            status="resolver_path_issue",
+            label="Resolver path issue",
+        )
+        result = analyze([obs(0, "192.168.1.1", 20), obs(0, "1.1.1.1", 20)], None, exported)
+        event = result["events"][0]
+        self.assertEqual(event["kind"], "watch")
+        self.assertEqual(event["attribution_assessment"]["candidate"], "resolver_path")
+        self.assertIn("resolver-path or DNS provider path issue", event["attribution_assessment"]["reason"])
+        summaries = [fact["summary"] for fact in event["supporting_facts"]]
+        self.assertIn("Resolver probes degraded: NextDNS primary and NextDNS secondary.", summaries)
+        self.assertIn("Gateway probe remained below local threshold.", summaries)
+
+    def test_target_group_internet_and_resolver_degraded_gateway_healthy(self) -> None:
+        result = analyze(
+            sustained_internet_observations(),
+            None,
+            target_group_export(internet=True, resolver=True, gateway=False),
+        )
+        event = result["events"][0]
+        self.assertEqual(event["attribution_assessment"]["candidate"], "upstream")
+        self.assertIn("broader upstream/WAN path issue", event["attribution_assessment"]["reason"])
+        self.assertIn(
+            "Both internet and resolver probes degraded, so the evidence does not isolate DNS from broader WAN path.",
+            event["uncertainties"],
+        )
+        self.assertEqual(event["evidence_strength"]["rating"], "strong")
+        self.assertIn("internet and resolver probes agreed", event["evidence_strength"]["reason"])
+
+    def test_target_group_gateway_degraded_with_wan_degradation_adds_local_ambiguity(self) -> None:
+        result = analyze(
+            sustained_internet_observations(),
+            None,
+            target_group_export(internet=True, resolver=True, gateway=True),
+        )
+        event = result["events"][0]
+        self.assertEqual(event["attribution_assessment"]["candidate"], "local")
+        self.assertIn("local gateway/LAN involvement is likely", event["attribution_assessment"]["reason"])
+        self.assertIn("Gateway probe degradation means local involvement cannot be ruled out.", event["uncertainties"])
+        summaries = [fact["summary"] for fact in event["supporting_facts"]]
+        self.assertIn("Gateway probe also degraded.", summaries)
+        self.assertIn("gateway degradation adds local-path ambiguity", event["evidence_strength"]["reason"])
+
+    def test_missing_target_group_fields_keep_existing_metadata_fallback(self) -> None:
+        result = analyze(sustained_internet_observations(), None)
+        event = result["events"][0]
+        self.assertEqual(
+            event["attribution_assessment"]["reason"],
+            "Internet-side degradation was detected while local gateway evidence stayed stable (0/2 elevated local samples).",
+        )
+        self.assertNotIn("target_group_evidence", {fact["kind"] for fact in event["supporting_facts"]})
+
+    def test_sparse_resolver_history_adds_uncertainty_and_limits_strength(self) -> None:
+        result = analyze(
+            sustained_internet_observations(),
+            None,
+            target_group_export(internet=True, resolver=True, gateway=False, resolver_samples=6),
+        )
+        event = result["events"][0]
+        self.assertIn(
+            "Resolver probes do not yet have enough history to establish a stable baseline.",
+            event["uncertainties"],
+        )
+        summaries = [fact["summary"] for fact in event["supporting_facts"]]
+        self.assertIn("Resolver probe history is limited.", summaries)
+        self.assertEqual(event["evidence_strength"]["rating"], "strong")
+        self.assertIn("resolver probe history is limited", event["evidence_strength"]["reason"])
+
+    def test_target_group_metadata_remains_json_serializable(self) -> None:
+        result = analyze(
+            sustained_internet_observations(),
+            None,
+            target_group_export(internet=True, resolver=True, gateway=False),
+        )
+        payload = result["events"][0]
+        self.assertEqual(json.loads(json.dumps(payload, default=str, sort_keys=True)), json.loads(json.dumps(payload, default=str)))
+
+    def test_v06_v07_style_attribution_exports_remain_compatible(self) -> None:
+        for exported in (
+            {
+                "attribution_label": "Likely upstream (ISP / path)",
+                "attribution_status": "likely_upstream",
+                "attribution_confidence": "high",
+                "attribution_evidence": {"summary": "WAN degraded while LAN stayed stable."},
+            },
+            {
+                "window_attribution": {
+                    "status": "likely_upstream",
+                    "label": "Likely upstream (ISP / path)",
+                    "confidence": "high",
+                    "evidence": ["WAN degraded while LAN stayed stable."],
+                }
+            },
+        ):
+            result = analyze(sustained_internet_observations(), None, exported)
+            event = result["events"][0]
+            self.assertEqual(event["attribution_assessment"]["candidate"], "upstream")
+            self.assertNotIn("target_group_evidence", {fact["kind"] for fact in event["supporting_facts"]})
 
     def test_generic_watch_event_keeps_new_metadata_optional_for_backward_compatibility(self) -> None:
         exported = {
