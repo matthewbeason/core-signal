@@ -7,7 +7,7 @@ Observer export and writes a concise Markdown morning briefing about what
 mattered in the most recent 24-hour observation window.
 
 Current status: active local-first reporting tool for Prime Observer exports.
-Current release: 0.7.0.
+Current release: 0.7.1.
 
 Portfolio context: Core Signal demonstrates deterministic local data
 interpretation, privacy-safe summary reporting, and scheduled macOS automation
