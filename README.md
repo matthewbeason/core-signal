@@ -1,12 +1,19 @@
 # Core Signal
 
+> [!WARNING]
+> Archived repository: Core Signal is retired as a standalone project.
+> Its useful interpretation and reporting capabilities are intended to move into
+> Prime Observer as an internal interpretation/reporting layer over time.
+> This repository is preserved for historical reference only and is no longer
+> the active home for new standalone development.
+
 Core Signal is a local-first interpretation layer for Prime Observer telemetry.
 
 Prime Observer observes network behavior. Core Signal interprets the latest Prime
 Observer export and writes a concise Markdown morning briefing about what
 mattered in the most recent 24-hour observation window.
 
-Current status: active local-first reporting tool for Prime Observer exports.
+Current status: archived standalone reporting tool preserved for reference.
 Current release: 0.7.1.
 
 Portfolio context: Core Signal demonstrates deterministic local data
